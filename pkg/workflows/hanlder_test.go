@@ -1,21 +1,21 @@
 package workflows
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
-	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/hpcloud/tail"
+	"github.com/pkg/errors"
 
 	"github.com/supergiant/control/pkg/clouds"
 	"github.com/supergiant/control/pkg/model"
-	"github.com/supergiant/control/pkg/node"
 	"github.com/supergiant/control/pkg/runner"
 	"github.com/supergiant/control/pkg/runner/ssh"
 	"github.com/supergiant/control/pkg/testutils"
@@ -78,68 +78,6 @@ func TestWorkflowHandlerGetWorkflow(t *testing.T) {
 	}
 }
 
-func TestTaskHandlerRunTask(t *testing.T) {
-	Init()
-	h := TaskHandler{
-		runnerFactory: func(cfg ssh.Config) (runner.Runner, error) {
-			return &testutils.MockRunner{}, nil
-		},
-		repository: &MockRepository{
-			map[string][]byte{},
-		},
-		cloudAccGetter: &mockCloudAccountService{
-			cloudAccount: &model.CloudAccount{
-				Name:     "testName",
-				Provider: clouds.DigitalOcean,
-				Credentials: map[string]string{
-					"fingerprints": "fingerprint",
-					"accessToken":  "abcd",
-				},
-			},
-			err: nil,
-		},
-	}
-
-	workflowName := "workflow1"
-	message := "hello, world!!!"
-	step := &MockStep{
-		name:     "mock_step",
-		messages: []string{message},
-	}
-
-	workflow := []steps.Step{step}
-	RegisterWorkFlow(workflowName, workflow)
-
-	reqBody := RunTaskRequest{
-		Cfg: steps.Config{
-			Timeout: time.Second * 1,
-		},
-		WorkflowName: workflowName,
-	}
-
-	body := &bytes.Buffer{}
-	err := json.NewEncoder(body).Encode(reqBody)
-
-	if err != nil {
-		t.Errorf("Unexpected err while json encoding req body %v", err)
-	}
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/", body)
-	h.RunTask(rec, req)
-
-	if rec.Code != http.StatusAccepted {
-		t.Errorf("Wrong response code expected %d received %d", http.StatusAccepted, rec.Code)
-	}
-
-	resp := &TaskResponse{}
-	json.NewDecoder(rec.Body).Decode(resp)
-
-	if len(resp.ID) == 0 {
-		t.Error("task id in response should not be empty")
-	}
-}
-
 func TestTaskHandlerRestartTask(t *testing.T) {
 	Init()
 	repository := &MockRepository{
@@ -183,10 +121,11 @@ func TestTaskHandlerRestartTask(t *testing.T) {
 	task := &Task{
 		ID: taskId,
 		Config: &steps.Config{
-			SshConfig: steps.SshConfig{
-				User: "root",
-				Port: "22",
-				BootstrapPrivateKey: `-----BEGIN RSA PRIVATE KEY-----
+			Kube: model.Kube{
+				SSHConfig: model.SSHConfig{
+					User: "root",
+					Port: "22",
+					BootstrapPrivateKey: `-----BEGIN RSA PRIVATE KEY-----
 MIIEpQIBAAKCAQEAtArxGzmUffkRNy4bpITg0oicUA6itrh2RumMoydra2QqRL8i
 sA6xBaPHbBAOJO/gY/h/qvr8Hnb38GFJcQQy2eENb83i2u8BVnnN2IFkgyCyYCN7
 DE54bQejH0xD4qMhXdyEUOyKaOBzHHBliyIR4HmobiddJho4G0Ku3onLDm+++XNG
@@ -213,9 +152,10 @@ dVUN1U8CgYEAw5N6ScysYb9Jsaurcykij4mn1tvXzpDcap/Lqu/QXSUJZU1D7Cac
 OOJSve1MuYQbV1LEIc15yMPsWTTik2Z98r9IL+3xdofh9yFaG1nxzi9OkN6aVMAz
 dZM6MSCYh9kcT0pi2FPmY9iXba9kx4XAnf+0YB5xCz9QSMk4W5xSTBs=
 -----END RSA PRIVATE KEY-----`,
-				Timeout: 10,
+					Timeout: 10,
+				},
 			},
-			Node: node.Node{
+			Node: model.Machine{
 				PublicIp: "10.20.30.40",
 			},
 		},
@@ -239,53 +179,84 @@ dZM6MSCYh9kcT0pi2FPmY9iXba9kx4XAnf+0YB5xCz9QSMk4W5xSTBs=
 	}
 }
 
-func TestWorkflowHandlerBuildWorkflow(t *testing.T) {
-	h := TaskHandler{
-		runnerFactory: func(cfg ssh.Config) (runner.Runner, error) {
-			return &testutils.MockRunner{}, nil
-		},
-		repository: &MockRepository{
-			map[string][]byte{},
-		},
-	}
-
-	message := "hello, world!!!"
-	step := &MockStep{
-		name:     "mock_step",
-		messages: []string{message},
-	}
-
-	steps.RegisterStep(step.Name(), step)
-
-	reqBody := BuildTaskRequest{
-		Cfg: steps.Config{
-			Timeout: time.Second * 1,
-		},
-		StepNames: []string{step.Name()},
-		SshConfig: ssh.Config{
-			Host:    "12.34.56.67",
-			Port:    "22",
-			User:    "root",
-			Timeout: 1,
-			Key:     []byte("")},
-	}
-
-	body := &bytes.Buffer{}
-	err := json.NewEncoder(body).Encode(reqBody)
+func TestTaskHandler_GetLogs(t *testing.T) {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/", body)
+	req, _ := http.NewRequest(http.MethodGet, "/tasks/abcd/logs/ws", nil)
 
-	h.BuildAndRunTask(rec, req)
+	rec.Header().Add("Authorization", "bearer none")
+	router := mux.NewRouter()
+	handler := TaskHandler{}
+	handler.Register(router)
 
-	resp := &TaskResponse{}
-	err = json.Unmarshal(rec.Body.Bytes(), resp)
+	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusCreated {
-		t.Errorf("Wrong response code expected %d actual %d", rec.Code, http.StatusCreated)
-		return
+	if rec.Code != http.StatusOK {
+		t.Errorf("Wrong status code expected %d actual %d",
+			http.StatusOK, rec.Code)
+	}
+}
+
+func TestTaskHandler_StreamLogs(t *testing.T) {
+	testCases := []struct {
+		description  string
+		getTailErr   error
+		t            *tail.Tail
+		expectedCode int
+	}{
+		{
+			description:  "wrong task id",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			description:  "wrong task id",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			description:  "file not found",
+			getTailErr:   os.ErrNotExist,
+			expectedCode: http.StatusNotFound,
+		},
+		{
+			description:  "unknown error",
+			getTailErr:   errors.New("error"),
+			expectedCode: http.StatusInternalServerError,
+		},
+		{
+			description: "upgrade error",
+			t: &tail.Tail{
+				Lines: make(chan *tail.Line),
+			},
+
+			expectedCode: http.StatusBadRequest,
+		},
 	}
 
-	if err != nil {
-		t.Errorf("Unexpected err while parsing response %v", err)
+	for _, testCase := range testCases {
+		t.Log(testCase.description)
+		rec := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, "/tasks/abcd/logs", nil)
+
+		router := mux.NewRouter()
+		handler := TaskHandler{
+			getTail: func(s string) (*tail.Tail, error) {
+				return testCase.t, testCase.getTailErr
+			},
+		}
+		handler.Register(router)
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != testCase.expectedCode {
+			t.Errorf("Wrong response code expected %d actual %d",
+				testCase.expectedCode, rec.Code)
+		}
+	}
+}
+
+func TestNewTaskHandler(t *testing.T) {
+	r := &testutils.MockStorage{}
+	h := NewTaskHandler(r, nil, nil)
+
+	if h == nil {
+		t.Errorf("Handler must not be nil")
 	}
 }

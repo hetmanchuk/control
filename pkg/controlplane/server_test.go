@@ -3,6 +3,7 @@ package controlplane
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gorilla/handlers"
@@ -113,5 +114,25 @@ func TestTrimPrefix(t *testing.T) {
 		if actualURL != testCase.output {
 			t.Errorf("url must be empty after trimming prefix actual %s", actualURL)
 		}
+	}
+}
+
+func TestNewVersionHandler(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/version", nil)
+	version := "2.0.0"
+
+	h := NewVersionHandler(version)
+
+	h(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("Wrong response code expected %d actual %d",
+			http.StatusOK, rec.Code)
+	}
+
+	if !strings.Contains(rec.Body.String(), version) {
+		t.Errorf("Version %s not found in response body %s",
+			rec.Body.String(), version)
 	}
 }

@@ -8,7 +8,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/supergiant/control/pkg/node"
+	"github.com/supergiant/control/pkg/model"
 	tm "github.com/supergiant/control/pkg/templatemanager"
 	"github.com/supergiant/control/pkg/workflows/steps"
 	"github.com/supergiant/control/pkg/workflows/steps/kubelet"
@@ -57,9 +57,9 @@ func (s *Step) Run(ctx context.Context, out io.Writer, config *steps.Config) err
 	}
 
 	// Mark current node as active to allow cluster check task select it for cluster wide task
-	config.Node.State = node.StateActive
+	config.Node.State = model.MachineStateActive
 	config.NodeChan() <- config.Node
-	config.SshConfig.BootstrapPrivateKey = ""
+	config.Kube.SSHConfig.BootstrapPrivateKey = ""
 
 	return nil
 }
@@ -73,7 +73,7 @@ func (s *Step) Rollback(context.Context, io.Writer, *steps.Config) error {
 }
 
 func (s *Step) Description() string {
-	return ""
+	return "Post start step executes after provisioning"
 }
 
 func (s *Step) Depends() []string {

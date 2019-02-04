@@ -13,7 +13,8 @@ import (
 
 	"github.com/supergiant/control/pkg/clouds"
 	"github.com/supergiant/control/pkg/clouds/digitaloceansdk"
-	"github.com/supergiant/control/pkg/node"
+	"github.com/supergiant/control/pkg/model"
+	"github.com/supergiant/control/pkg/sgerrors"
 	"github.com/supergiant/control/pkg/util"
 	"github.com/supergiant/control/pkg/workflows/steps"
 )
@@ -21,25 +22,31 @@ import (
 type CreateInstanceStep struct {
 	DropletTimeout time.Duration
 	CheckPeriod    time.Duration
+
+	getServices func(string) (DropletService, KeyService)
 }
 
 func NewCreateInstanceStep(dropletTimeout, checkPeriod time.Duration) *CreateInstanceStep {
 	return &CreateInstanceStep{
 		DropletTimeout: dropletTimeout,
 		CheckPeriod:    checkPeriod,
+		getServices: func(accessToken string) (DropletService, KeyService) {
+			client := digitaloceansdk.New(accessToken).GetClient()
+
+			return client.Droplets, client.Keys
+		},
 	}
 }
 
 func (s *CreateInstanceStep) Run(ctx context.Context, output io.Writer, config *steps.Config) error {
-	// TODO(stgleb): Extract getting digital ocean sdk to function that will allow it to be mocked.
-	c := digitaloceansdk.New(config.DigitalOceanConfig.AccessToken).GetClient()
+	dropletSvc, keySvc := s.getServices(config.DigitalOceanConfig.AccessToken)
 	// Node name is created from cluster name plus part of task id plus role
 	config.DigitalOceanConfig.Name = util.MakeNodeName(config.ClusterName,
 		config.TaskID, config.IsMaster)
 
 	// TODO(stgleb): Move keys creation for provisioning to provisioner to be able to get
 	// this key on cluster check phase.
-	fingers, err := s.createKeys(ctx, c.Keys, config)
+	fingers, err := s.createKeys(ctx, keySvc, config)
 
 	if err != nil {
 		return err
@@ -63,27 +70,27 @@ func (s *CreateInstanceStep) Run(ctx context.Context, output io.Writer, config *
 		Tags: tags,
 	}
 
-	role := node.RoleMaster
+	role := model.RoleMaster
 	if !config.IsMaster {
-		role = node.RoleNode
+		role = model.RoleNode
 	}
 
-	config.Node = node.Node{
+	config.Node = model.Machine{
 		TaskID:   config.TaskID,
 		Role:     role,
 		Provider: clouds.DigitalOcean,
 		Size:     config.DigitalOceanConfig.Size,
 		Region:   config.DigitalOceanConfig.Region,
-		State:    node.StateBuilding,
+		State:    model.MachineStateBuilding,
 		Name:     config.DigitalOceanConfig.Name,
 	}
 
 	// Update node state in cluster
 	config.NodeChan() <- config.Node
-	droplet, _, err := c.Droplets.Create(ctx, dropletRequest)
+	droplet, _, err := dropletSvc.Create(ctx, dropletRequest)
 
 	if err != nil {
-		config.Node.State = node.StateError
+		config.Node.State = model.MachineStateError
 		config.NodeChan() <- config.Node
 		return errors.Wrap(err, "dropletService has returned an error in Run job")
 	}
@@ -94,7 +101,7 @@ func (s *CreateInstanceStep) Run(ctx context.Context, output io.Writer, config *
 	for {
 		select {
 		case <-ticker.C:
-			droplet, _, err = c.Droplets.Get(ctx, droplet.ID)
+			droplet, _, err = dropletSvc.Get(ctx, droplet.ID)
 
 			if err != nil {
 				return err
@@ -109,7 +116,7 @@ func (s *CreateInstanceStep) Run(ctx context.Context, output io.Writer, config *
 				config.Node.CreatedAt = int64(createdAt)
 				config.Node.PublicIp = getPublicIpPort(droplet.Networks.V4)
 				config.Node.PrivateIp = getPrivateIpPort(droplet.Networks.V4)
-				config.Node.State = node.StateProvisioning
+				config.Node.State = model.MachineStateProvisioning
 				config.Node.Name = config.DigitalOceanConfig.Name
 
 				// Update node state in cluster
@@ -126,7 +133,7 @@ func (s *CreateInstanceStep) Run(ctx context.Context, output io.Writer, config *
 				return nil
 			}
 		case <-after:
-			return ErrTimeoutExceeded
+			return sgerrors.ErrTimeoutExceeded
 		}
 	}
 
@@ -134,25 +141,6 @@ func (s *CreateInstanceStep) Run(ctx context.Context, output io.Writer, config *
 }
 
 func (s *CreateInstanceStep) Rollback(context.Context, io.Writer, *steps.Config) error {
-	return nil
-}
-
-func (s *CreateInstanceStep) tagDroplet(ctx context.Context, tagService godo.TagsService, dropletId int, tags []string) error {
-	// Tag droplet
-	for _, tag := range tags {
-		input := &godo.TagResourcesRequest{
-			Resources: []godo.Resource{
-				{
-					ID:   strconv.Itoa(dropletId),
-					Type: godo.DropletResourceType,
-				},
-			},
-		}
-		if _, err := tagService.TagResources(ctx, tag, input); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -165,16 +153,18 @@ func (s *CreateInstanceStep) Depends() []string {
 }
 
 func (s *CreateInstanceStep) Description() string {
-	return ""
+	return "Create instance in Digital Ocean"
 }
 
 func (s *CreateInstanceStep) createKeys(ctx context.Context, keyService KeyService, config *steps.Config) ([]godo.DropletCreateSSHKey, error) {
 	var fingers []godo.DropletCreateSSHKey
 
+	logrus.Debugf("Step %s", CreateMachineStepName)
+
 	// Create key for provisioning
 	key, err := createKey(ctx, keyService,
 		util.MakeKeyName(config.DigitalOceanConfig.Name, false),
-		config.SshConfig.BootstrapPublicKey)
+		config.Kube.SSHConfig.BootstrapPublicKey)
 
 	if err != nil {
 		return nil, errors.Wrap(err, "create provision key")
@@ -187,12 +177,12 @@ func (s *CreateInstanceStep) createKeys(ctx context.Context, keyService KeyServi
 	// Create user provided key
 	key, _ = createKey(ctx, keyService,
 		util.MakeKeyName(config.DigitalOceanConfig.Name, true),
-		config.SshConfig.PublicKey)
+		config.Kube.SSHConfig.PublicKey)
 
 	// NOTE(stgleb): In case if this key is already used by user of this account
 	// just compute fingerprint and pass it
 	if key == nil {
-		fg, _ := fingerprint(config.SshConfig.PublicKey)
+		fg, _ := fingerprint(config.Kube.SSHConfig.PublicKey)
 		fingers = append(fingers, godo.DropletCreateSSHKey{
 			Fingerprint: fg,
 		})

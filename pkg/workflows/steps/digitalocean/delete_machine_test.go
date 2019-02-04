@@ -12,7 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/mock"
 
-	"github.com/supergiant/control/pkg/node"
+	"github.com/supergiant/control/pkg/model"
 	"github.com/supergiant/control/pkg/workflows/steps"
 )
 
@@ -85,7 +85,7 @@ func TestDeleteMachineRun(t *testing.T) {
 				return svc
 			}
 			err := step.Run(context.Background(), &bytes.Buffer{}, &steps.Config{
-				Node: node.Node{
+				Node: model.Machine{
 					Name: testCase.machineName,
 				},
 			})
@@ -119,5 +119,36 @@ func TestStep_Rollback(t *testing.T) {
 
 	if err != nil {
 		t.Errorf("unexpected error while rollback %v", err)
+	}
+}
+
+func TestNewDeleteMachineStep(t *testing.T) {
+	timeout := time.Nanosecond
+	step := NewDeleteMachineStep(timeout)
+
+	if step == nil {
+		t.Errorf("Step must not be nil")
+	}
+
+	if step.timeout != timeout {
+		t.Errorf("wrong timeout expected %v actual %v",
+			timeout, step.timeout)
+	}
+
+	if step.getDeleteService == nil {
+		t.Errorf("delete service must not be nil")
+	}
+
+	if svc := step.getDeleteService("token"); svc == nil {
+		t.Errorf("service must be nil")
+	}
+}
+
+func TestDeleteMachineStep_Description(t *testing.T) {
+	step := &DeleteMachineStep{}
+
+	if desc := step.Description(); desc != "delete digital ocean instance" {
+		t.Errorf("Wrong description expected "+
+			"delete digital ocean instance actual %s", desc)
 	}
 }

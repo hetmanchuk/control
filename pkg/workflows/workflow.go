@@ -5,24 +5,24 @@ import (
 
 	"github.com/supergiant/control/pkg/workflows/statuses"
 	"github.com/supergiant/control/pkg/workflows/steps"
-	"github.com/supergiant/control/pkg/workflows/steps/amazon"
-	"github.com/supergiant/control/pkg/workflows/steps/authorizedKeys"
 	"github.com/supergiant/control/pkg/workflows/steps/certificates"
 	"github.com/supergiant/control/pkg/workflows/steps/clustercheck"
 	"github.com/supergiant/control/pkg/workflows/steps/cni"
-	"github.com/supergiant/control/pkg/workflows/steps/digitalocean"
 	"github.com/supergiant/control/pkg/workflows/steps/docker"
 	"github.com/supergiant/control/pkg/workflows/steps/downloadk8sbinary"
+	"github.com/supergiant/control/pkg/workflows/steps/drain"
 	"github.com/supergiant/control/pkg/workflows/steps/etcd"
 	"github.com/supergiant/control/pkg/workflows/steps/flannel"
-	"github.com/supergiant/control/pkg/workflows/steps/gce"
 	"github.com/supergiant/control/pkg/workflows/steps/kubelet"
 	"github.com/supergiant/control/pkg/workflows/steps/manifest"
 	"github.com/supergiant/control/pkg/workflows/steps/network"
 	"github.com/supergiant/control/pkg/workflows/steps/poststart"
 	"github.com/supergiant/control/pkg/workflows/steps/prometheus"
+	"github.com/supergiant/control/pkg/workflows/steps/provider"
 	"github.com/supergiant/control/pkg/workflows/steps/ssh"
+	"github.com/supergiant/control/pkg/workflows/steps/storageclass"
 	"github.com/supergiant/control/pkg/workflows/steps/tiller"
+	"github.com/supergiant/control/pkg/workflows/steps/authorizedKeys"
 )
 
 // StepStatus aggregates data that is needed to track progress
@@ -39,21 +39,12 @@ type Workflow []steps.Step
 const (
 	Prefix = "tasks"
 
-	Cluster = "Cluster"
-
-	DigitalOceanMaster        = "DigitalOceanMaster"
-	DigitalOceanNode          = "DigitalOceanNode"
-	DigitalOceanDeleteNode    = "DigitalOceanDeleteNode"
-	DigitalOceanDeleteCluster = "DigitalOceanDeleteCluster"
-	AWSMaster                 = "AWSMaster"
-	AWSNode                   = "AWSNode"
-	AWSPreProvision           = "AWSPreProvisionCluster"
-	AWSDeleteCluster          = "AWSDeleteCluster"
-	AWSDeleteNode             = "AWSDeleteNode"
-	GCEMaster                 = "GCEMaster"
-	GCENode                   = "GCENode"
-	GCEDeleteCluster          = "GCEDeleteCluster"
-	GCEDeleteNode             = "GCEDeleteNode"
+	PostProvision   = "PostProvision"
+	PreProvision    = "PreProvision"
+	ProvisionMaster = "ProvisionMaster"
+	ProvisionNode   = "ProvisionNode"
+	DeleteNode      = "DeleteNode"
+	DeleteCluster   = "DeleteCluster"
 )
 
 type WorkflowSet struct {
@@ -72,47 +63,12 @@ var (
 func Init() {
 	workflowMap = make(map[string]Workflow)
 
-	digitalOceanMasterWorkflow := []steps.Step{
-		steps.GetStep(digitalocean.CreateMachineStepName),
-		steps.GetStep(ssh.StepName),
-		steps.GetStep(downloadk8sbinary.StepName),
-		steps.GetStep(cni.StepName),
-		steps.GetStep(etcd.StepName),
-		steps.GetStep(network.StepName),
-		steps.GetStep(flannel.StepName),
-		steps.GetStep(docker.StepName),
-		steps.GetStep(certificates.StepName),
-		steps.GetStep(manifest.StepName),
-		steps.GetStep(kubelet.StepName),
-		steps.GetStep(poststart.StepName),
-	}
-	digitalOceanNodeWorkflow := []steps.Step{
-		steps.GetStep(digitalocean.CreateMachineStepName),
-		steps.GetStep(ssh.StepName),
-		steps.GetStep(downloadk8sbinary.StepName),
-		steps.GetStep(manifest.StepName),
-		steps.GetStep(flannel.StepName),
-		steps.GetStep(docker.StepName),
-		steps.GetStep(certificates.StepName),
-		steps.GetStep(kubelet.StepName),
-		steps.GetStep(cni.StepName),
-		steps.GetStep(poststart.StepName),
+	preProvision := []steps.Step{
+		provider.StepPreProvision{},
 	}
 
-	awsPreProvision := []steps.Step{
-		steps.GetStep(amazon.StepFindAMI),
-		steps.GetStep(amazon.StepCreateVPC),
-		steps.GetStep(amazon.StepCreateSecurityGroups),
-		steps.GetStep(amazon.StepNameCreateInstanceProfiles),
-		steps.GetStep(amazon.StepImportKeyPair),
-		steps.GetStep(amazon.StepCreateInternetGateway),
-		steps.GetStep(amazon.StepCreateSubnets),
-		steps.GetStep(amazon.StepCreateRouteTable),
-		steps.GetStep(amazon.StepAssociateRouteTable),
-	}
-
-	awsMasterWorkflow := []steps.Step{
-		steps.GetStep(amazon.StepNameCreateEC2Instance),
+	masterWorkflow := []steps.Step{
+		provider.StepCreateMachine{},
 		steps.GetStep(ssh.StepName),
 		steps.GetStep(authorizedKeys.StepName),
 		steps.GetStep(downloadk8sbinary.StepName),
@@ -127,106 +83,46 @@ func Init() {
 		steps.GetStep(poststart.StepName),
 	}
 
-	awsNodeWorkflow := []steps.Step{
-		steps.GetStep(amazon.StepNameCreateEC2Instance),
+	nodeWorkflow := []steps.Step{
+		provider.StepCreateMachine{},
 		steps.GetStep(ssh.StepName),
 		steps.GetStep(authorizedKeys.StepName),
 		steps.GetStep(downloadk8sbinary.StepName),
-		steps.GetStep(certificates.StepName),
 		steps.GetStep(manifest.StepName),
 		steps.GetStep(flannel.StepName),
 		steps.GetStep(docker.StepName),
+		steps.GetStep(certificates.StepName),
 		steps.GetStep(kubelet.StepName),
 		steps.GetStep(cni.StepName),
 		steps.GetStep(poststart.StepName),
 	}
 
-	commonWorkflow := []steps.Step{
+	postProvision := []steps.Step{
 		steps.GetStep(ssh.StepName),
 		steps.GetStep(clustercheck.StepName),
+		steps.GetStep(storageclass.StepName),
 		steps.GetStep(tiller.StepName),
 		steps.GetStep(prometheus.StepName),
 	}
 
-	digitalOceanDeleteNodeWorkflow := []steps.Step{
-		steps.GetStep(digitalocean.DeleteMachineStepName),
+	deleteMachineWorkflow := []steps.Step{
+		steps.GetStep(drain.StepName),
+		provider.StepDeleteMachine{},
 	}
 
-	digitalOceanDeleteClusterWorkflow := []steps.Step{
-		steps.GetStep(digitalocean.DeleteClusterMachines),
-		steps.GetStep(digitalocean.DeleteDeleteKeysStepName),
-	}
-
-	awsDeleteClusterWorkflow := []steps.Step{
-		steps.GetStep(amazon.DeleteClusterMachinesStepName),
-		steps.GetStep(amazon.DeleteSecurityGroupsStepName),
-		steps.GetStep(amazon.DisassociateRouteTableStepName),
-		steps.GetStep(amazon.DeleteSubnetsStepName),
-		steps.GetStep(amazon.DeleteRouteTableStepName),
-		steps.GetStep(amazon.DeleteInternetGatewayStepName),
-		steps.GetStep(amazon.DeleteKeyPairStepName),
-		steps.GetStep(amazon.DeleteVPCStepName),
-	}
-
-	awsDeleteNodeWorkflow := []steps.Step{
-		steps.GetStep(amazon.DeleteNodeStepName),
-	}
-
-	gceNodeWorkflow := []steps.Step{
-		steps.GetStep(gce.CreateInstanceStepName),
-		steps.GetStep(ssh.StepName),
-		steps.GetStep(authorizedKeys.StepName),
-		steps.GetStep(downloadk8sbinary.StepName),
-		steps.GetStep(manifest.StepName),
-		steps.GetStep(flannel.StepName),
-		steps.GetStep(docker.StepName),
-		steps.GetStep(certificates.StepName),
-		steps.GetStep(kubelet.StepName),
-		steps.GetStep(cni.StepName),
-		steps.GetStep(poststart.StepName),
-	}
-
-	gceMasterWorkflow := []steps.Step{
-		steps.GetStep(gce.CreateInstanceStepName),
-		steps.GetStep(ssh.StepName),
-		steps.GetStep(authorizedKeys.StepName),
-		steps.GetStep(downloadk8sbinary.StepName),
-		steps.GetStep(cni.StepName),
-		steps.GetStep(etcd.StepName),
-		steps.GetStep(network.StepName),
-		steps.GetStep(flannel.StepName),
-		steps.GetStep(docker.StepName),
-		steps.GetStep(certificates.StepName),
-		steps.GetStep(manifest.StepName),
-		steps.GetStep(kubelet.StepName),
-		steps.GetStep(poststart.StepName),
-	}
-
-	gceDeleteCluster := []steps.Step{
-		steps.GetStep(gce.DeleteClusterStepName),
-	}
-
-	gceDeleteNode := []steps.Step{
-		steps.GetStep(gce.DeleteNodeStepName),
+	deleteClusterWorkflow := []steps.Step{
+		provider.StepCleanUp{},
 	}
 
 	m.Lock()
 	defer m.Unlock()
 
-	workflowMap[DigitalOceanDeleteNode] = digitalOceanDeleteNodeWorkflow
-	workflowMap[Cluster] = commonWorkflow
-	workflowMap[DigitalOceanMaster] = digitalOceanMasterWorkflow
-	workflowMap[DigitalOceanNode] = digitalOceanNodeWorkflow
-	workflowMap[DigitalOceanDeleteCluster] = digitalOceanDeleteClusterWorkflow
-	workflowMap[AWSMaster] = awsMasterWorkflow
-	workflowMap[AWSNode] = awsNodeWorkflow
-	workflowMap[AWSPreProvision] = awsPreProvision
-	workflowMap[AWSDeleteCluster] = awsDeleteClusterWorkflow
-	workflowMap[AWSDeleteNode] = awsDeleteNodeWorkflow
-	workflowMap[GCENode] = gceNodeWorkflow
-	workflowMap[GCEMaster] = gceMasterWorkflow
-	workflowMap[GCEDeleteCluster] = gceDeleteCluster
-	workflowMap[GCEDeleteNode] = gceDeleteNode
+	workflowMap[PreProvision] = preProvision
+	workflowMap[ProvisionMaster] = masterWorkflow
+	workflowMap[ProvisionNode] = nodeWorkflow
+	workflowMap[DeleteNode] = deleteMachineWorkflow
+	workflowMap[DeleteCluster] = deleteClusterWorkflow
+	workflowMap[PostProvision] = postProvision
 }
 
 func RegisterWorkFlow(workflowName string, workflow Workflow) {

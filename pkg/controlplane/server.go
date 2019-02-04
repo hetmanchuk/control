@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
@@ -29,9 +28,7 @@ import (
 	"github.com/supergiant/control/pkg/sghelm"
 	"github.com/supergiant/control/pkg/storage"
 	"github.com/supergiant/control/pkg/templatemanager"
-	"github.com/supergiant/control/pkg/testutils/assert"
 	"github.com/supergiant/control/pkg/user"
-	"github.com/supergiant/control/pkg/util"
 	"github.com/supergiant/control/pkg/workflows"
 	"github.com/supergiant/control/pkg/workflows/steps/amazon"
 	"github.com/supergiant/control/pkg/workflows/steps/authorizedKeys"
@@ -41,6 +38,7 @@ import (
 	"github.com/supergiant/control/pkg/workflows/steps/digitalocean"
 	"github.com/supergiant/control/pkg/workflows/steps/docker"
 	"github.com/supergiant/control/pkg/workflows/steps/downloadk8sbinary"
+	"github.com/supergiant/control/pkg/workflows/steps/drain"
 	"github.com/supergiant/control/pkg/workflows/steps/etcd"
 	"github.com/supergiant/control/pkg/workflows/steps/flannel"
 	"github.com/supergiant/control/pkg/workflows/steps/gce"
@@ -50,6 +48,7 @@ import (
 	"github.com/supergiant/control/pkg/workflows/steps/poststart"
 	"github.com/supergiant/control/pkg/workflows/steps/prometheus"
 	"github.com/supergiant/control/pkg/workflows/steps/ssh"
+	"github.com/supergiant/control/pkg/workflows/steps/storageclass"
 	"github.com/supergiant/control/pkg/workflows/steps/tiller"
 )
 
@@ -79,7 +78,8 @@ func (srv *Server) Shutdown() {
 type Config struct {
 	Port          int
 	Addr          string
-	EtcdUrl       string
+	StorageMode   string
+	StorageURI    string
 	TemplatesDir  string
 	SpawnInterval time.Duration
 	UiDir         string
@@ -106,9 +106,6 @@ func New(cfg *Config) (*Server, error) {
 	}
 
 	s := NewServer(r, cfg)
-	if err := generateUserIfColdStart(cfg); err != nil {
-		return nil, err
-	}
 
 	return s, nil
 }
@@ -143,47 +140,7 @@ func NewServer(router *mux.Router, cfg *Config) *Server {
 	return s
 }
 
-//generateUserIfColdStart checks if there are any users in the db and if not (i.e. on first launch) generates a root user
-func generateUserIfColdStart(cfg *Config) error {
-	etcdCfg := clientv3.Config{
-		DialTimeout: time.Second * 10,
-		Endpoints:   []string{cfg.EtcdUrl},
-	}
-	repository := storage.NewETCDRepository(etcdCfg)
-	userService := user.NewService(user.DefaultStoragePrefix, repository)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	users, err := userService.GetAll(ctx)
-	if err != nil {
-		return err
-	}
-
-	if len(users) == 0 {
-		u := &user.User{
-			Login:    "root",
-			Password: util.RandomString(13),
-		}
-		logrus.Infof("first time launch detected, use %s as login and %s as password", u.Login, u.Password)
-		err := userService.Create(ctx, u)
-		if err != nil {
-			return nil
-		}
-	}
-
-	return nil
-}
-
 func validate(cfg *Config) error {
-	if cfg.EtcdUrl == "" {
-		return errors.New("etcd url can't be empty")
-	}
-
-	if err := assert.CheckETCD(cfg.EtcdUrl); err != nil {
-		return errors.Wrapf(err, "etcd url %s", cfg.EtcdUrl)
-	}
-
 	if cfg.Port <= 0 {
 		return errors.New("port can't be negative")
 	}
@@ -197,13 +154,15 @@ func validate(cfg *Config) error {
 
 func configureApplication(cfg *Config) (*mux.Router, error) {
 	//TODO will work for now, but we should revisit ETCD configuration later
-	etcdCfg := clientv3.Config{
-		Endpoints: []string{cfg.EtcdUrl},
-	}
 	router := mux.NewRouter()
 
 	protectedAPI := router.PathPrefix("/v1/api").Subrouter()
-	repository := storage.NewETCDRepository(etcdCfg)
+	repository, err := storage.GetStorage(cfg.StorageMode, cfg.StorageURI)
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "get storage type %s uri %s",
+			cfg.StorageMode, cfg.StorageURI)
+	}
 
 	accountService := account.NewService(account.DefaultStoragePrefix, repository)
 	accountHandler := account.NewHandler(accountService)
@@ -216,7 +175,8 @@ func configureApplication(cfg *Config) (*mux.Router, error) {
 
 	router.HandleFunc("/version", NewVersionHandler(cfg.Version))
 	router.HandleFunc("/auth", userHandler.Authenticate).Methods(http.MethodPost)
-	//Opening it up for testing right now, will be protected after implementing initial user generation
+	router.HandleFunc("/root", userHandler.RegisterRootUser).Methods(http.MethodPost)
+	router.HandleFunc("/coldstart", userHandler.IsColdStart).Methods(http.MethodGet)
 	protectedAPI.HandleFunc("/users", userHandler.Create).Methods(http.MethodPost)
 
 	profileService := profile.NewService(profile.DefaultKubeProfilePreifx, repository)
@@ -245,6 +205,8 @@ func configureApplication(cfg *Config) (*mux.Router, error) {
 	clustercheck.Init()
 	prometheus.Init()
 	gce.Init()
+	storageclass.Init()
+	drain.Init()
 
 	amazon.InitFindAMI(amazon.GetEC2)
 	amazon.InitImportKeyPair(amazon.GetEC2)
@@ -275,7 +237,11 @@ func configureApplication(cfg *Config) (*mux.Router, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "new helm service")
 	}
-	go ensureHelmRepositories(helmService)
+	if coldstart, err := userService.IsColdStart(context.Background()); err == nil && coldstart {
+		go ensureHelmRepositories(helmService)
+	} else if err != nil {
+		return nil, err
+	}
 
 	helmHandler := sghelm.NewHandler(helmService)
 	helmHandler.Register(protectedAPI)
@@ -287,12 +253,14 @@ func configureApplication(cfg *Config) (*mux.Router, error) {
 		kubeService,
 		cfg.SpawnInterval)
 	provisionHandler := provisioner.NewHandler(kubeService, accountService,
-		taskProvisioner)
+		profileService, taskProvisioner)
 	provisionHandler.Register(protectedAPI)
-	apiProxy := proxy.NewReverseProxyContainer(cfg.ProxiesPortRange, logrus.New().WithField("component", "proxy"))
+	apiProxy := proxy.NewReverseProxyContainer(cfg.ProxiesPortRange,
+		logrus.New().WithField("component", "proxy"))
 
 	kubeHandler := kube.NewHandler(kubeService, accountService,
-		taskProvisioner, repository, apiProxy)
+		profileService, taskProvisioner, taskProvisioner,
+		repository, apiProxy)
 	kubeHandler.Register(protectedAPI)
 
 	authMiddleware := api.Middleware{
@@ -339,6 +307,7 @@ func ensureHelmRepositories(svc sghelm.Servicer) {
 		}
 		logrus.Infof("helm repository has been added: %s", entry.Name)
 	}
+
 }
 
 func serveUI(cfg *Config, router *mux.Router) error {

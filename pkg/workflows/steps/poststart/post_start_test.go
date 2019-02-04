@@ -12,7 +12,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/supergiant/control/pkg/node"
+	"github.com/supergiant/control/pkg/model"
 	"github.com/supergiant/control/pkg/profile"
 	"github.com/supergiant/control/pkg/runner"
 	"github.com/supergiant/control/pkg/templatemanager"
@@ -67,7 +67,7 @@ func TestPostStartMaster(t *testing.T) {
 		RBACEnabled: rbacEnabled,
 		Timeout:     time.Second * 10,
 	}
-	cfg.Node = node.Node{
+	cfg.Node = model.Machine{
 		PrivateIp: "10.20.30.40",
 	}
 	cfg.Runner = r
@@ -114,7 +114,7 @@ func TestPostStartNode(t *testing.T) {
 		Host:    "127.0.0.1",
 		Timeout: time.Second * 10,
 	}
-	cfg.Node = node.Node{
+	cfg.Node = model.Machine{
 		PrivateIp: "10.20.30.40",
 	}
 	cfg.Runner = r
@@ -266,5 +266,15 @@ func TestInitPanic(t *testing.T) {
 
 	if s == nil {
 		t.Error("Step not found")
+	}
+}
+
+func TestStep_Description(t *testing.T) {
+	s := &Step{}
+
+	if desc := s.Description(); desc != "Post start step executes after "+
+		"provisioning" {
+		t.Errorf("Wrong desription expected %s actual %s",
+			"Post start step executes after provisioning", desc)
 	}
 }

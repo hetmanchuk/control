@@ -15,14 +15,16 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/helm/pkg/proto/hapi/chart"
 	"k8s.io/helm/pkg/proto/hapi/release"
 
 	"github.com/supergiant/control/pkg/clouds"
 	"github.com/supergiant/control/pkg/message"
 	"github.com/supergiant/control/pkg/model"
-	"github.com/supergiant/control/pkg/node"
 	"github.com/supergiant/control/pkg/profile"
+	"github.com/supergiant/control/pkg/proxy"
 	"github.com/supergiant/control/pkg/sgerrors"
 	"github.com/supergiant/control/pkg/testutils"
 	"github.com/supergiant/control/pkg/workflows"
@@ -77,6 +79,38 @@ type accServiceMock struct {
 
 type mockNodeProvisioner struct {
 	mock.Mock
+}
+
+type mockProvisioner struct {
+	mock.Mock
+}
+
+type mockProfileGetter struct {
+	mock.Mock
+}
+
+func (m *mockProfileGetter) Get(ctx context.Context,
+	profileID string) (*profile.Profile, error) {
+	args := m.Called(ctx, profileID)
+
+	val, ok := args.Get(0).(*profile.Profile)
+	if !ok {
+		return nil, args.Error(1)
+	}
+	return val, args.Error(1)
+}
+
+func (m *mockProvisioner) RestartClusterProvisioning(ctx context.Context,
+	clusterProfile *profile.Profile,
+	config *steps.Config,
+	taskIdMap map[string][]string) error {
+	args := m.Called(ctx, clusterProfile, config, taskIdMap)
+
+	val, ok := args.Get(0).(error)
+	if !ok {
+		return args.Error(0)
+	}
+	return val
 }
 
 type bufferCloser struct {
@@ -181,17 +215,47 @@ func (m *kubeServiceMock) GetCerts(ctx context.Context, kname, cname string) (*B
 	}
 	return val, args.Error(1)
 }
-func (m *kubeServiceMock) InstallRelease(ctx context.Context, kname string, rls *ReleaseInput) (*release.Release, error) {
+func (m *kubeServiceMock) InstallRelease(ctx context.Context,
+	kname string, rls *ReleaseInput) (*release.Release, error) {
 	return m.rls, m.rlsErr
 }
-func (m *kubeServiceMock) ReleaseDetails(ctx context.Context, kname string, rlsName string) (*release.Release, error) {
+func (m *kubeServiceMock) ReleaseDetails(ctx context.Context,
+	kname string, rlsName string) (*release.Release, error) {
 	return m.rls, m.rlsErr
 }
-func (m *kubeServiceMock) ListReleases(ctx context.Context, kname, ns, offset string, limit int) ([]*model.ReleaseInfo, error) {
+func (m *kubeServiceMock) ListReleases(ctx context.Context,
+	kname, ns, offset string, limit int) ([]*model.ReleaseInfo, error) {
 	return m.rlsInfoList, m.rlsErr
 }
-func (m *kubeServiceMock) DeleteRelease(ctx context.Context, kname, rlsName string, purge bool) (*model.ReleaseInfo, error) {
+func (m *kubeServiceMock) DeleteRelease(ctx context.Context,
+	kname, rlsName string, purge bool) (*model.ReleaseInfo, error) {
 	return m.rlsInfo, m.rlsErr
+}
+
+type mockContainter struct {
+	mock.Mock
+}
+
+func (m *mockContainter) RegisterProxies(targets []proxy.Target) error {
+	args := m.Called(targets)
+	val, ok := args.Get(0).(error)
+	if !ok {
+		return args.Error(0)
+	}
+	return val
+}
+
+func (m *mockContainter) GetProxies(prefix string) map[string]*proxy.ServiceReverseProxy {
+	args := m.Called(prefix)
+	val, ok := args.Get(0).(map[string]*proxy.ServiceReverseProxy)
+	if !ok {
+		return nil
+	}
+	return val
+}
+
+func (m *mockContainter) Shutdown(ctx context.Context) {
+	m.Called(ctx)
 }
 
 func (a *accServiceMock) Get(ctx context.Context, name string) (*model.CloudAccount, error) {
@@ -248,7 +312,8 @@ func TestHandler_createKube(t *testing.T) {
 	for i, tc := range tcs {
 		// setup handler
 		svc := new(kubeServiceMock)
-		h := NewHandler(svc, nil, nil, nil, nil)
+		h := NewHandler(svc, nil,
+			nil, nil, nil, nil, nil)
 
 		req, err := http.NewRequest(http.MethodPost, "/kubes",
 			bytes.NewReader(tc.rawKube))
@@ -319,7 +384,8 @@ func TestHandler_getKube(t *testing.T) {
 	for i, tc := range tcs {
 		// setup handler
 		svc := new(kubeServiceMock)
-		h := NewHandler(svc, nil, nil, nil, nil)
+		h := NewHandler(svc, nil, nil,
+			nil, nil, nil, nil)
 
 		// prepare
 		req, err := http.NewRequest(http.MethodGet, "/kubes/"+tc.kubeName, nil)
@@ -381,7 +447,8 @@ func TestHandler_listKubes(t *testing.T) {
 	for i, tc := range tcs {
 		// setup handler
 		svc := new(kubeServiceMock)
-		h := NewHandler(svc, nil, nil, nil, nil)
+		h := NewHandler(svc, nil, nil,
+			nil, nil, nil, nil)
 
 		// prepare
 		req, err := http.NewRequest(http.MethodGet, "/kubes", nil)
@@ -515,7 +582,7 @@ func TestHandler_deleteKube(t *testing.T) {
 			mock.Anything).Return([][]byte{}, nil)
 
 		workflows.Init()
-		workflows.RegisterWorkFlow(workflows.DigitalOceanDeleteCluster, []steps.Step{})
+		workflows.RegisterWorkFlow(workflows.DeleteCluster, []steps.Step{})
 
 		rr := httptest.NewRecorder()
 
@@ -523,7 +590,8 @@ func TestHandler_deleteKube(t *testing.T) {
 		mockProvisioner.On("Cancel", mock.Anything).
 			Return(nil)
 
-		h := NewHandler(svc, accSvc, mockProvisioner, mockRepo, nil)
+		h := NewHandler(svc, accSvc, nil,
+			mockProvisioner, nil, mockRepo, nil)
 
 		router := mux.NewRouter().SkipClean(true)
 		h.Register(router)
@@ -573,7 +641,8 @@ func TestHandler_listResources(t *testing.T) {
 	for i, tc := range tcs {
 		// setup handler
 		svc := new(kubeServiceMock)
-		h := NewHandler(svc, nil, nil, nil, nil)
+		h := NewHandler(svc, nil, nil,
+			nil, nil, nil, nil)
 
 		// prepare
 		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("/kubes/%s/resources", tc.kubeName), nil)
@@ -640,7 +709,8 @@ func TestHandler_getResources(t *testing.T) {
 	for i, tc := range tcs {
 		// setup handler
 		svc := new(kubeServiceMock)
-		h := NewHandler(svc, nil, nil, nil, nil)
+		h := NewHandler(svc, nil, nil,
+			nil, nil, nil, nil)
 
 		// prepare
 		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("/kubes/%s/resources/%s", tc.kubeName, tc.resourceName), nil)
@@ -700,6 +770,7 @@ func TestAddNodeToKube(t *testing.T) {
 			"test",
 			&model.Kube{
 				AccountName: "test",
+				Tasks:       make(map[string][]string),
 			},
 			nil,
 			"test",
@@ -713,6 +784,7 @@ func TestAddNodeToKube(t *testing.T) {
 			"test",
 			&model.Kube{
 				AccountName: "test",
+				Tasks:       make(map[string][]string),
 			},
 			nil,
 			"test",
@@ -729,9 +801,10 @@ func TestAddNodeToKube(t *testing.T) {
 			"test",
 			&model.Kube{
 				AccountName: "test",
-				Masters: map[string]*node.Node{
+				Masters: map[string]*model.Machine{
 					"": {},
 				},
+				Tasks: make(map[string][]string),
 			},
 			nil,
 			"test",
@@ -770,7 +843,9 @@ func TestAddNodeToKube(t *testing.T) {
 			Return(mock.Anything, testCase.provisionErr)
 		mockProvisioner.On("Cancel", mock.Anything).
 			Return(nil)
-		h := NewHandler(svc, accService, mockProvisioner, nil, nil)
+		h := NewHandler(svc, accService, nil,
+			mockProvisioner, nil,
+			nil, nil)
 
 		data, _ := json.Marshal(nodeProfile)
 		b := bytes.NewBuffer(data)
@@ -781,7 +856,7 @@ func TestAddNodeToKube(t *testing.T) {
 		rec := httptest.NewRecorder()
 		router := mux.NewRouter()
 
-		router.HandleFunc("/kubes/{kubeID}/nodes", h.addNode)
+		router.HandleFunc("/kubes/{kubeID}/nodes", h.addMachine)
 		router.ServeHTTP(rec, req)
 
 		if rec.Code != testCase.expectedCode {
@@ -836,7 +911,7 @@ func TestDeleteNodeFromKube(t *testing.T) {
 			"test",
 			"test",
 			&model.Kube{
-				Masters: map[string]*node.Node{
+				Masters: map[string]*model.Machine{
 					"test": {
 						Name: "test",
 					},
@@ -854,7 +929,7 @@ func TestDeleteNodeFromKube(t *testing.T) {
 			"test",
 			"test",
 			&model.Kube{
-				Nodes: map[string]*node.Node{
+				Nodes: map[string]*model.Machine{
 					"test2": {
 						Name: "test2",
 					},
@@ -873,7 +948,7 @@ func TestDeleteNodeFromKube(t *testing.T) {
 			"test",
 			&model.Kube{
 				AccountName: "test",
-				Nodes: map[string]*node.Node{
+				Nodes: map[string]*model.Machine{
 					"test": {
 						Name: "test",
 					},
@@ -892,7 +967,7 @@ func TestDeleteNodeFromKube(t *testing.T) {
 			"test",
 			&model.Kube{
 				AccountName: "test",
-				Nodes: map[string]*node.Node{
+				Nodes: map[string]*model.Machine{
 					"test": {
 						Name: "test",
 					},
@@ -911,7 +986,7 @@ func TestDeleteNodeFromKube(t *testing.T) {
 			"test",
 			&model.Kube{
 				AccountName: "test",
-				Nodes: map[string]*node.Node{
+				Nodes: map[string]*model.Machine{
 					"test": {
 						Name: "test",
 					},
@@ -935,7 +1010,7 @@ func TestDeleteNodeFromKube(t *testing.T) {
 	}
 
 	workflows.Init()
-	workflows.RegisterWorkFlow(workflows.DigitalOceanDeleteNode, []steps.Step{})
+	workflows.RegisterWorkFlow(workflows.DeleteNode, []steps.Step{})
 
 	for _, testCase := range testCases {
 		t.Log(testCase.testName)
@@ -959,16 +1034,12 @@ func TestDeleteNodeFromKube(t *testing.T) {
 		handler := Handler{
 			svc:            svc,
 			accountService: accService,
-			workflowMap: map[clouds.Name]workflows.WorkflowSet{
-				clouds.DigitalOcean: {
-					DeleteNode: workflows.DigitalOceanDeleteNode},
-			},
-			getWriter: testCase.getWriter,
-			repo:      mockRepo,
+			getWriter:      testCase.getWriter,
+			repo:           mockRepo,
 		}
 
 		router := mux.NewRouter()
-		router.HandleFunc("/{kubeID}/nodes/{nodename}", handler.deleteNode).Methods(http.MethodDelete)
+		router.HandleFunc("/{kubeID}/nodes/{nodename}", handler.deleteMachine).Methods(http.MethodDelete)
 
 		req, _ := http.NewRequest(http.MethodDelete, fmt.Sprintf("/%s/nodes/%s", testCase.kubeName, testCase.nodeName), nil)
 		rec := httptest.NewRecorder()
@@ -1000,7 +1071,9 @@ func TestKubeTasks(t *testing.T) {
 		{
 			description: "task not found",
 			kubeResp: &model.Kube{
-				Tasks: []string{"taskID"},
+				Tasks: map[string][]string{
+					workflows.MasterTask: {"taskID"},
+				},
 			},
 			kubeErr: nil,
 			repoErr: sgerrors.ErrNotFound,
@@ -1008,7 +1081,9 @@ func TestKubeTasks(t *testing.T) {
 		{
 			description: "marshall error",
 			kubeResp: &model.Kube{
-				Tasks: []string{"taskID"},
+				Tasks: map[string][]string{
+					workflows.MasterTask: {"taskID"},
+				},
 			},
 			kubeErr:  nil,
 			repoData: []byte(`{`),
@@ -1018,7 +1093,9 @@ func TestKubeTasks(t *testing.T) {
 		{
 			description: "success",
 			kubeResp: &model.Kube{
-				Tasks: []string{"taskID"},
+				Tasks: map[string][]string{
+					workflows.MasterTask: {"taskID"},
+				},
 			},
 			kubeErr:  nil,
 			repoData: []byte(`{"config": {"clusterId":"test"}}`),
@@ -1069,7 +1146,9 @@ func TestDeleteKubeTasks(t *testing.T) {
 			description: "repo not found",
 			kubeErr:     nil,
 			kubeResp: &model.Kube{
-				Tasks: []string{"not_found_id"},
+				Tasks: map[string][]string{
+					workflows.MasterTask: {"not_found_id"},
+				},
 			},
 			repoErr: sgerrors.ErrNotFound,
 		},
@@ -1077,7 +1156,9 @@ func TestDeleteKubeTasks(t *testing.T) {
 			description: "success",
 			kubeErr:     nil,
 			kubeResp: &model.Kube{
-				Tasks: []string{"1234"},
+				Tasks: map[string][]string{
+					workflows.MasterTask: {"1234"},
+				},
 			},
 
 			repoData: []byte(`{"config": {"clusterId":"test"}}`),
@@ -1192,8 +1273,10 @@ func TestGetTasks(t *testing.T) {
 			description: "internal error",
 			kubeID:      "test",
 			kubeResp: &model.Kube{
-				ID:    "test",
-				Tasks: []string{"1234"},
+				ID: "test",
+				Tasks: map[string][]string{
+					workflows.MasterTask: {"1234"},
+				},
 			},
 			repoData:     []byte(``),
 			expectedCode: http.StatusInternalServerError,
@@ -1202,8 +1285,10 @@ func TestGetTasks(t *testing.T) {
 			description: "nothing found",
 			kubeID:      "test",
 			kubeResp: &model.Kube{
-				ID:    "test",
-				Tasks: []string{"1234"},
+				ID: "test",
+				Tasks: map[string][]string{
+					workflows.MasterTask: {"1234"},
+				},
 			},
 			repoErr:      sgerrors.ErrInvalidJson,
 			expectedCode: http.StatusNotFound,
@@ -1212,8 +1297,10 @@ func TestGetTasks(t *testing.T) {
 			description: "success",
 			kubeID:      "test",
 			kubeResp: &model.Kube{
-				ID:    "test",
-				Tasks: []string{"1234"},
+				ID: "test",
+				Tasks: map[string][]string{
+					workflows.MasterTask: {"1234"},
+				},
 			},
 			repoData:     []byte(`{"config": {"clusterId":"test"}}`),
 			expectedCode: http.StatusOK,
@@ -1494,7 +1581,8 @@ func TestHandler_getKubeconfig(t *testing.T) {
 	for i, tc := range tcs {
 		// setup handler
 		svc := new(kubeServiceMock)
-		h := NewHandler(svc, nil, nil, nil, nil)
+		h := NewHandler(svc, nil, nil,
+			nil, nil, nil, nil)
 
 		// prepare
 		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("/kubes/%s/users/%s/kubeconfig", tc.kubeID, tc.userName), nil)
@@ -1600,7 +1688,7 @@ func TestGetClusterMetrics(t *testing.T) {
 		{
 			kubeServiceGetResp: &model.Kube{
 				Name: "test",
-				Masters: map[string]*node.Node{
+				Masters: map[string]*model.Machine{
 					"master-1": {
 						Name:     "master-1",
 						PublicIp: "10.20.30.40",
@@ -1616,7 +1704,7 @@ func TestGetClusterMetrics(t *testing.T) {
 		{
 			kubeServiceGetResp: &model.Kube{
 				Name: "test",
-				Masters: map[string]*node.Node{
+				Masters: map[string]*model.Machine{
 					"master-1": {
 						Name:     "master-1",
 						PublicIp: "10.20.30.40",
@@ -1700,7 +1788,7 @@ func TestGetNodesMetrics(t *testing.T) {
 		{
 			kubeServiceGetResp: &model.Kube{
 				Name: "test",
-				Masters: map[string]*node.Node{
+				Masters: map[string]*model.Machine{
 					"master-1": {
 						Name:     "master-1",
 						PublicIp: "10.20.30.40",
@@ -1716,7 +1804,7 @@ func TestGetNodesMetrics(t *testing.T) {
 		{
 			kubeServiceGetResp: &model.Kube{
 				Name: "test",
-				Masters: map[string]*node.Node{
+				Masters: map[string]*model.Machine{
 					"master-1": {
 						Name:     "master-1",
 						PublicIp: "10.20.30.40",
@@ -1824,6 +1912,350 @@ func TestGetNodesMetrics(t *testing.T) {
 				t.Errorf("Unexpected count of nodes expected %d actual %d",
 					expectedNodeCount, len(resp))
 			}
+		}
+	}
+}
+
+func TestRestarProvisioningKube(t *testing.T) {
+	testCases := []struct {
+		description string
+		kubeName    string
+
+		kube           *model.Kube
+		kubeServiceErr error
+
+		kubeProfile *profile.Profile
+		profileErr  error
+
+		accountName string
+		account     *model.CloudAccount
+		accountErr  error
+
+		provisionErr error
+
+		expectedCode int
+	}{
+		{
+			description:    "kube not found",
+			kubeName:       "test",
+			kubeServiceErr: sgerrors.ErrNotFound,
+			expectedCode:   http.StatusNotFound,
+		},
+		{
+			description: "profile not found",
+			kubeName:    "test",
+			kube: &model.Kube{
+				AccountName: "test",
+				Tasks:       make(map[string][]string),
+			},
+
+			profileErr:   sgerrors.ErrNotFound,
+			expectedCode: http.StatusNotFound,
+		},
+		{
+			description: "account not found",
+			kubeName:    "test",
+			kube: &model.Kube{
+				AccountName: "test",
+				Tasks:       make(map[string][]string),
+			},
+
+			kubeProfile:  &profile.Profile{},
+			accountName:  "not found",
+			accountErr:   sgerrors.ErrNotFound,
+			expectedCode: http.StatusNotFound,
+		},
+		{
+			description: "unsupported cloud provider",
+			kubeName:    "test",
+			kube: &model.Kube{
+				AccountName: "test",
+				Tasks:       make(map[string][]string),
+			},
+
+			kubeProfile: &profile.Profile{},
+			accountName: "not found",
+			account: &model.CloudAccount{
+				Provider: "unsupported",
+			},
+			expectedCode: http.StatusInternalServerError,
+		},
+		{
+			description: "Error while provision",
+			kubeName:    "test",
+			kube: &model.Kube{
+				AccountName: "test",
+				Tasks:       make(map[string][]string),
+			},
+
+			kubeProfile: &profile.Profile{},
+			accountName: "not found",
+			account: &model.CloudAccount{
+				Provider: "unsupported",
+			},
+			provisionErr: errors.New("provision error"),
+			expectedCode: http.StatusInternalServerError,
+		},
+		{
+			description: "Success",
+			kubeName:    "test",
+			kube: &model.Kube{
+				AccountName: "test",
+				Tasks:       make(map[string][]string),
+			},
+
+			kubeProfile: &profile.Profile{},
+			accountName: "not found",
+			account: &model.CloudAccount{
+				Provider: clouds.AWS,
+			},
+			expectedCode: http.StatusAccepted,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Log(testCase.description)
+		svc := new(kubeServiceMock)
+		svc.On(serviceGet, mock.Anything, mock.Anything).
+			Return(testCase.kube, testCase.kubeServiceErr)
+		svc.On(serviceCreate, mock.Anything, mock.Anything).
+			Return(nil)
+
+		profileSvc := new(mockProfileGetter)
+		profileSvc.On("Get", mock.Anything,
+			mock.Anything).Return(testCase.kubeProfile,
+			testCase.profileErr)
+
+		accService := new(accServiceMock)
+		accService.On("Get", mock.Anything, mock.Anything).
+			Return(testCase.account, testCase.accountErr)
+
+		mockProvisioner := new(mockProvisioner)
+		mockProvisioner.On("RestartClusterProvisioning",
+			mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+			Return(testCase.provisionErr)
+
+		h := NewHandler(svc, accService, profileSvc,
+			nil, mockProvisioner,
+			nil, nil)
+
+		req, _ := http.NewRequest(http.MethodPost,
+			fmt.Sprintf("/kubes/%s/restart", testCase.kubeName),
+			nil)
+		rec := httptest.NewRecorder()
+		router := mux.NewRouter()
+
+		router.HandleFunc("/kubes/{kubeID}/restart", h.restartKubeProvisioning)
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != testCase.expectedCode {
+			t.Errorf("Wrong error code expected %d actual %d",
+				testCase.expectedCode, rec.Code)
+		}
+	}
+}
+
+func TestGetServices(t *testing.T) {
+	testCases := []struct {
+		name string
+
+		getKubeErr error
+		getKube    *model.Kube
+
+		getServicesErr error
+		k8sServices    *corev1.ServiceList
+
+		registerProxiesErr error
+		getProxies         map[string]*proxy.ServiceReverseProxy
+
+		expectedCode int
+	}{
+		{
+			name:         "kube not found",
+			getKubeErr:   sgerrors.ErrNotFound,
+			expectedCode: http.StatusNotFound,
+		},
+		{
+			name:         "kube internal error",
+			getKubeErr:   errors.New("unknown"),
+			expectedCode: http.StatusInternalServerError,
+		},
+		{
+			name: "get services error",
+			getKube: &model.Kube{
+				ID: "1234",
+				Masters: map[string]*model.Machine{
+					"key": {
+						ID: "key",
+					},
+				},
+			},
+			getServicesErr: errors.New("error"),
+			expectedCode:   http.StatusInternalServerError,
+		},
+		{
+			name: "register proxy error",
+
+			getKube: &model.Kube{
+				ID: "1234",
+				Masters: map[string]*model.Machine{
+					"key": {
+						ID: "key",
+					},
+				},
+			},
+			k8sServices:        &corev1.ServiceList{},
+			registerProxiesErr: errors.New("error"),
+			expectedCode:       http.StatusInternalServerError,
+		},
+		{
+			name: "success 1",
+
+			getKube: &model.Kube{
+				ID: "1234",
+				Masters: map[string]*model.Machine{
+					"key": {
+						ID: "key",
+					},
+				},
+			},
+			k8sServices: &corev1.ServiceList{
+				Items: []corev1.Service{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								clusterService: "false",
+							},
+						},
+						Spec: corev1.ServiceSpec{
+							Ports: []corev1.ServicePort{
+								{
+									Name:     "http",
+									Protocol: "TCP",
+								},
+							},
+						},
+					},
+				},
+			},
+			getProxies: map[string]*proxy.ServiceReverseProxy{
+				"kubeID": {
+					ServingBase: "http:/10.20.30.40:9090",
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name: "success 2",
+
+			getKube: &model.Kube{
+				ID: "1234",
+				Masters: map[string]*model.Machine{
+					"key": {
+						ID: "key",
+					},
+				},
+			},
+			k8sServices: &corev1.ServiceList{
+				Items: []corev1.Service{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								clusterService: "true",
+							},
+						},
+						Spec: corev1.ServiceSpec{
+							Ports: []corev1.ServicePort{
+								{
+									Name:     "http",
+									Protocol: "TCP",
+								},
+							},
+						},
+					},
+				},
+			},
+			getProxies: map[string]*proxy.ServiceReverseProxy{
+				"kubeID": {
+					ServingBase: "http:/10.20.30.40:9090",
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name: "success 3",
+
+			getKube: &model.Kube{
+				ID: "1234",
+				Masters: map[string]*model.Machine{
+					"key": {
+						ID: "key",
+					},
+				},
+			},
+			k8sServices: &corev1.ServiceList{
+				Items: []corev1.Service{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								clusterService: "true",
+							},
+						},
+						Spec: corev1.ServiceSpec{
+							Ports: []corev1.ServicePort{
+								{
+									Name:     "other",
+									Protocol: "unknown",
+								},
+								{
+									Name:     "http",
+									Protocol: "TCP",
+								},
+							},
+						},
+					},
+				},
+			},
+			getProxies: map[string]*proxy.ServiceReverseProxy{
+				"kubeID": {
+					ServingBase: "http:/10.20.30.40:9090",
+				},
+			},
+			expectedCode: http.StatusOK,
+		},
+	}
+
+	for _, tc := range testCases {
+		kubeSvc := &kubeServiceMock{}
+		kubeSvc.On("Get", mock.Anything, mock.Anything).
+			Return(tc.getKube, tc.getKubeErr)
+		mockProxies := &mockContainter{}
+		mockProxies.On("RegisterProxies",
+			mock.Anything).Return(tc.registerProxiesErr)
+		mockProxies.On("GetProxies",
+			mock.Anything).Return(tc.getProxies)
+		getSvc := func(*model.Kube, string) (*corev1.ServiceList, error) {
+			return tc.k8sServices, tc.getServicesErr
+		}
+
+		handler := &Handler{
+			listK8sServices: getSvc,
+			svc:             kubeSvc,
+			proxies:         mockProxies,
+		}
+
+		rec := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet,
+			"/kubes/kubeID/services", nil)
+
+		router := mux.NewRouter().SkipClean(true)
+		handler.Register(router)
+
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != tc.expectedCode {
+			t.Errorf("TC: %s: wrong response code expected "+
+				"%d actual %d", tc.name, tc.expectedCode, rec.Code)
 		}
 	}
 }

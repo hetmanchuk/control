@@ -15,7 +15,6 @@ import (
 
 	"github.com/supergiant/control/pkg/clouds"
 	"github.com/supergiant/control/pkg/model"
-	"github.com/supergiant/control/pkg/node"
 	"github.com/supergiant/control/pkg/sgerrors"
 	"github.com/supergiant/control/pkg/workflows/steps"
 )
@@ -103,7 +102,7 @@ func FillCloudAccountCredentials(ctx context.Context, cloudAccount *model.CloudA
 	config.Provider = cloudAccount.Provider
 
 	// Bind private key to config
-	err := BindParams(cloudAccount.Credentials, &config.SshConfig)
+	err := BindParams(cloudAccount.Credentials, &config.Kube.SSHConfig)
 
 	if err != nil {
 		return err
@@ -122,7 +121,7 @@ func FillCloudAccountCredentials(ctx context.Context, cloudAccount *model.CloudA
 	}
 }
 
-func GetRandomNode(nodeMap map[string]*node.Node) *node.Node {
+func GetRandomNode(nodeMap map[string]*model.Machine) *model.Machine {
 	for key := range nodeMap {
 		return nodeMap[key]
 	}
@@ -135,9 +134,15 @@ func GetWriter(name string) (io.WriteCloser, error) {
 }
 
 func LoadCloudSpecificDataFromKube(k *model.Kube, config *steps.Config) error {
-	config.SshConfig.BootstrapPublicKey = string(k.BootstrapPublicKey)
-	config.SshConfig.BootstrapPrivateKey = string(k.BootstrapPrivateKey)
-	config.SshConfig.PublicKey = string(k.SshPublicKey)
+	if k == nil {
+		return sgerrors.ErrNilEntity
+	}
+	config.Kube = *k
+
+	// TODO: Is it ok?
+	if k.CloudSpec == nil {
+		return nil
+	}
 
 	switch config.Provider {
 	case clouds.AWS:
@@ -150,13 +155,14 @@ func LoadCloudSpecificDataFromKube(k *model.Kube, config *steps.Config) error {
 		config.AWSConfig.KeyPairName = k.CloudSpec[clouds.AwsKeyPairName]
 		config.AWSConfig.MastersSecurityGroupID = k.CloudSpec[clouds.AwsMastersSecGroupID]
 		config.AWSConfig.NodesSecurityGroupID = k.CloudSpec[clouds.AwsNodesSecgroupID]
-		config.SshConfig.BootstrapPrivateKey = k.CloudSpec[clouds.AwsSshBootstrapPrivateKey]
-		config.SshConfig.PublicKey = k.CloudSpec[clouds.AwsUserProvidedSshPublicKey]
 		config.AWSConfig.RouteTableID = k.CloudSpec[clouds.AwsRouteTableID]
 		config.AWSConfig.InternetGatewayID = k.CloudSpec[clouds.AwsInternetGateWayID]
 		config.AWSConfig.MastersInstanceProfile = k.CloudSpec[clouds.AwsMasterInstanceProfile]
 		config.AWSConfig.NodesInstanceProfile = k.CloudSpec[clouds.AwsNodeInstanceProfile]
 		config.AWSConfig.ImageID = k.CloudSpec[clouds.AwsImageID]
+
+		config.Kube.SSHConfig.BootstrapPrivateKey = k.CloudSpec[clouds.AwsSshBootstrapPrivateKey]
+		config.Kube.SSHConfig.PublicKey = k.CloudSpec[clouds.AwsUserProvidedSshPublicKey]
 		return nil
 	case clouds.GCE:
 		config.GCEConfig.Region = k.Region

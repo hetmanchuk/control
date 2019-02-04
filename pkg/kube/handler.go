@@ -2,24 +2,25 @@ package kube
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/asaskevich/govalidator.v8"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 
 	"github.com/supergiant/control/pkg/clouds"
 	"github.com/supergiant/control/pkg/message"
 	"github.com/supergiant/control/pkg/model"
-	"github.com/supergiant/control/pkg/node"
 	"github.com/supergiant/control/pkg/profile"
 	"github.com/supergiant/control/pkg/proxy"
 	"github.com/supergiant/control/pkg/sgerrors"
@@ -30,49 +31,16 @@ import (
 	"github.com/supergiant/control/pkg/workflows/steps"
 )
 
-var (
-	cache  metricCache
-	m      sync.Mutex
-	client *http.Client
+const (
+	clusterService = "kubernetes.io/cluster-service"
 )
-
-type metricCache struct {
-	m    sync.RWMutex
-	data map[string]entry
-}
-
-func (c *metricCache) get(key string) *MetricResponse {
-	c.m.RLock()
-	defer c.m.RUnlock()
-	e := c.data[key]
-
-	if e.timestamp == 0 {
-		return nil
-	}
-
-	if e.timestamp < time.Now().Unix()-60 {
-		return nil
-	}
-
-	return e.value
-}
-
-func (c *metricCache) set(key string, value *MetricResponse) {
-	c.m.Lock()
-	defer c.m.Unlock()
-	c.data[key] = entry{
-		timestamp: time.Now().Unix(),
-		value:     value,
-	}
-}
-
-type entry struct {
-	timestamp int64
-	value     *MetricResponse
-}
 
 type accountGetter interface {
 	Get(context.Context, string) (*model.CloudAccount, error)
+}
+
+type profileGetter interface {
+	Get(context.Context, string) (*profile.Profile, error)
 }
 
 type nodeProvisioner interface {
@@ -82,41 +50,11 @@ type nodeProvisioner interface {
 	Cancel(string) error
 }
 
-type k8SServices struct {
-	Kind       string `json:"kind"`
-	APIVersion string `json:"apiVersion"`
-	Metadata   struct {
-		SelfLink        string `json:"selfLink"`
-		ResourceVersion string `json:"resourceVersion"`
-	} `json:"metadata"`
-	Items []struct {
-		Metadata struct {
-			Name              string            `json:"name"`
-			Namespace         string            `json:"namespace"`
-			SelfLink          string            `json:"selfLink"`
-			UID               string            `json:"uid"`
-			ResourceVersion   string            `json:"resourceVersion"`
-			CreationTimestamp time.Time         `json:"creationTimestamp"`
-			Labels            map[string]string `json:"labels"`
-		} `json:"metadata"`
-		Spec struct {
-			Ports []struct {
-				Name     string `json:"name"`
-				Protocol string `json:"protocol"`
-				Port     int    `json:"port"`
-			} `json:"ports"`
-			Selector struct {
-				App string `json:"app"`
-			} `json:"selector"`
-			ClusterIP       string `json:"clusterIP"`
-			Type            string `json:"type"`
-			SessionAffinity string `json:"sessionAffinity"`
-		} `json:"spec"`
-		Status struct {
-			LoadBalancer struct {
-			} `json:"loadBalancer"`
-		} `json:"status"`
-	} `json:"items"`
+type kubeProvisioner interface {
+	RestartClusterProvisioning(ctx context.Context,
+		clusterProfile *profile.Profile,
+		config *steps.Config,
+		taskIdMap map[string][]string) error
 }
 
 type ServiceInfo struct {
@@ -143,40 +81,24 @@ type Handler struct {
 	svc             Interface
 	accountService  accountGetter
 	nodeProvisioner nodeProvisioner
-	workflowMap     map[clouds.Name]workflows.WorkflowSet
-	repo            storage.Interface
+	kubeProvisioner kubeProvisioner
+	profileSvc      profileGetter
+
+	repo    storage.Interface
+	proxies proxy.Container
+
 	getWriter       func(string) (io.WriteCloser, error)
 	getMetrics      func(string, *model.Kube) (*MetricResponse, error)
-	proxies         proxy.Container
-}
-
-func init() {
-	cache = metricCache{
-		data: make(map[string]entry),
-	}
-	tr := &http.Transport{
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-		TLSHandshakeTimeout: time.Second * 30,
-		MaxIdleConnsPerHost: 100,
-	}
-	client = &http.Client{
-		Transport: tr,
-		Timeout:   time.Second * 30,
-	}
-}
-
-// Use shared http.Client to perform request
-func doReq(req *http.Request) (*http.Response, error) {
-	m.Lock()
-	defer m.Unlock()
-	return client.Do(req)
+	listK8sServices func(*model.Kube, string) (*corev1.ServiceList, error)
 }
 
 // NewHandler constructs a Handler for kubes.
 func NewHandler(
 	svc Interface,
 	accountService accountGetter,
+	profileSvc profileGetter,
 	provisioner nodeProvisioner,
+	kubeProvisioner kubeProvisioner,
 	repo storage.Interface,
 	proxies proxy.Container,
 ) *Handler {
@@ -184,55 +106,45 @@ func NewHandler(
 		svc:             svc,
 		accountService:  accountService,
 		nodeProvisioner: provisioner,
-		workflowMap: map[clouds.Name]workflows.WorkflowSet{
-			clouds.DigitalOcean: {
-				DeleteCluster: workflows.DigitalOceanDeleteCluster,
-				DeleteNode:    workflows.DigitalOceanDeleteNode,
-			},
-			clouds.AWS: {
-				DeleteCluster: workflows.AWSDeleteCluster,
-				DeleteNode:    workflows.AWSDeleteNode,
-			},
-			clouds.GCE: {
-				DeleteCluster: workflows.GCEDeleteCluster,
-				DeleteNode:    workflows.GCEDeleteNode,
-			},
-		},
-		repo:      repo,
-		getWriter: util.GetWriter,
+		kubeProvisioner: kubeProvisioner,
+		profileSvc:      profileSvc,
+		repo:            repo,
+		getWriter:       util.GetWriter,
 		getMetrics: func(metricURI string, k *model.Kube) (*MetricResponse, error) {
-			if m := cache.get(metricURI); m != nil {
-				logrus.Debugf("metric cache hit")
-				return m, nil
+			cfg, err := NewConfigFor(k)
+			if err != nil {
+				return nil, errors.Wrap(err, "build kubernetes rest config")
 			}
-			logrus.Debugf("metric cache miss")
+			kclient, err := rest.UnversionedRESTClientFor(cfg)
+			if err != nil {
+				return nil, errors.Wrap(err, "build kubernetes client")
+			}
+
+			raw, err := kclient.Get().RequestURI(metricURI).Do().Raw()
+			if err != nil {
+				return nil, errors.Wrap(err, "retrieve metrics")
+			}
 
 			metricResponse := &MetricResponse{}
-			// TODO(stgleb): Add caching for metric
-			req, err := http.NewRequest(http.MethodGet, metricURI, nil)
-
+			err = json.Unmarshal(raw, metricResponse)
 			if err != nil {
-				return nil, err
+				return nil, errors.Wrap(err, "unmarshal")
 			}
-
-			req.SetBasicAuth(k.User, k.Password)
-			logrus.Debugf("Get metric with URI %s for kube %s", metricURI, k.ID)
-			resp, err := doReq(req)
-
-			if err != nil {
-				return nil, err
-			}
-
-			err = json.NewDecoder(resp.Body).Decode(metricResponse)
-
-			if err != nil {
-				return nil, err
-			}
-
-			resp.Body.Close()
-			cache.set(metricURI, metricResponse)
 
 			return metricResponse, nil
+		},
+		listK8sServices: func(k *model.Kube, selector string) (*corev1.ServiceList, error) {
+			cfg, err := NewConfigFor(k)
+			if err != nil {
+				return nil, errors.Wrap(err, "build kubernetes rest config")
+			}
+			c, err := clientcorev1.NewForConfig(cfg)
+			if err != nil {
+				return nil, errors.Wrapf(err, "build kubernetes client")
+			}
+			return c.Services(metav1.NamespaceAll).List(metav1.ListOptions{
+				LabelSelector: selector,
+			})
 		},
 		proxies: proxies,
 	}
@@ -258,11 +170,18 @@ func (h *Handler) Register(r *mux.Router) {
 	r.HandleFunc("/kubes/{kubeID}/certs/{cname}", h.getCerts).Methods(http.MethodGet)
 	r.HandleFunc("/kubes/{kubeID}/tasks", h.getTasks).Methods(http.MethodGet)
 
-	r.HandleFunc("/kubes/{kubeID}/nodes", h.addNode).Methods(http.MethodPost)
-	r.HandleFunc("/kubes/{kubeID}/nodes/{nodename}", h.deleteNode).Methods(http.MethodDelete)
-	r.HandleFunc("/kubes/{kubeID}/metrics", h.getClusterMetrics).Methods(http.MethodGet)
+	// DEPRECATED: has been moved to /kubes/{kubeID}/machines
+	r.HandleFunc("/kubes/{kubeID}/nodes", h.addMachine).Methods(http.MethodPost)
+	// DEPRECATED: has been moved to /kubes/{kubeID}/machines
+	r.HandleFunc("/kubes/{kubeID}/nodes/{nodename}", h.deleteMachine).Methods(http.MethodDelete)
+
+	r.HandleFunc("/kubes/{kubeID}/machines", h.addMachine).Methods(http.MethodPost)
+	r.HandleFunc("/kubes/{kubeID}/machines/{nodename}", h.deleteMachine).Methods(http.MethodDelete)
+
 	r.HandleFunc("/kubes/{kubeID}/nodes/metrics", h.getNodesMetrics).Methods(http.MethodGet)
+	r.HandleFunc("/kubes/{kubeID}/metrics", h.getClusterMetrics).Methods(http.MethodGet)
 	r.HandleFunc("/kubes/{kubeID}/services", h.getServices).Methods(http.MethodGet)
+	r.HandleFunc("/kubes/{kubeID}/restart", h.restartKubeProvisioning).Methods(http.MethodPost)
 }
 
 func (h *Handler) getTasks(w http.ResponseWriter, r *http.Request) {
@@ -410,7 +329,7 @@ func (h *Handler) deleteKube(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := workflows.NewTask(h.workflowMap[acc.Provider].DeleteCluster, h.repo)
+	t, err := workflows.NewTask(workflows.DeleteCluster, h.repo)
 
 	if err != nil {
 		if sgerrors.IsNotFound(err) {
@@ -573,7 +492,7 @@ func (h *Handler) getCerts(w http.ResponseWriter, r *http.Request) {
 }
 
 // Add node to working kube
-func (h *Handler) addNode(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) addMachine(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	kubeID := vars["kubeID"]
 	k, err := h.svc.Get(r.Context(), kubeID)
@@ -619,6 +538,7 @@ func (h *Handler) addNode(w http.ResponseWriter, r *http.Request) {
 		UbuntuVersion:   k.OperatingSystemVersion,
 		DockerVersion:   k.DockerVersion,
 		K8SVersion:      k.K8SVersion,
+		K8SServicesCIDR: k.ServicesCIDR,
 		HelmVersion:     k.HelmVersion,
 		User:            k.User,
 		Password:        k.Password,
@@ -673,7 +593,8 @@ func (h *Handler) addNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Add tasks ids to kube object
-	k.Tasks = append(k.Tasks, tasks...)
+	k.Tasks[workflows.NodeTask] = append(k.Tasks[workflows.NodeTask], tasks...)
+
 	if err := h.svc.Create(ctx, k); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -690,7 +611,7 @@ func (h *Handler) addNode(w http.ResponseWriter, r *http.Request) {
 }
 
 // TODO(stgleb): cover with unit tests
-func (h *Handler) deleteNode(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) deleteMachine(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
 	kubeID := vars["kubeID"]
@@ -714,7 +635,7 @@ func (h *Handler) deleteNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var n *node.Node
+	var n *model.Machine
 
 	if n = k.Nodes[nodeName]; n == nil {
 		http.NotFound(w, r)
@@ -731,11 +652,9 @@ func (h *Handler) deleteNode(w http.ResponseWriter, r *http.Request) {
 
 		message.SendUnknownError(w, err)
 		return
-
 	}
 
-	t, err := workflows.NewTask(h.workflowMap[acc.Provider].DeleteNode, h.repo)
-
+	t, err := workflows.NewTask(workflows.DeleteNode, h.repo)
 	if err != nil {
 		if sgerrors.IsNotFound(err) {
 			http.NotFound(w, r)
@@ -747,11 +666,16 @@ func (h *Handler) deleteNode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	config := &steps.Config{
-		Provider:         k.Provider,
+		Kube:     *k,
+		Provider: k.Provider,
+		DrainConfig: steps.DrainConfig{
+			PrivateIP: n.PrivateIp,
+		},
 		ClusterID:        k.ID,
 		ClusterName:      k.Name,
 		CloudAccountName: k.AccountName,
-		Node: *n,
+		Node:             *n,
+		Masters:          steps.NewMap(k.Masters),
 	}
 
 	err = util.FillCloudAccountCredentials(r.Context(), acc, config)
@@ -772,15 +696,12 @@ func (h *Handler) deleteNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	util.MakeFileName(t.ID)
-	writer, err := h.getWriter(t.ID)
+	writer, err := h.getWriter(util.MakeFileName(t.ID))
 
 	if err != nil {
 		message.SendUnknownError(w, err)
 		return
 	}
-
-	errChan := t.Run(context.Background(), *config, writer)
 
 	// Update cluster state when deletion completes
 	go func() {
@@ -791,7 +712,7 @@ func (h *Handler) deleteNode(w http.ResponseWriter, r *http.Request) {
 			logrus.Errorf("Node %s not found", nodeName)
 			return
 		}
-		nodeToDelete.State = node.StateDeleting
+		nodeToDelete.State = model.MachineStateDeleting
 		k.Nodes[nodeName] = nodeToDelete
 		err := h.svc.Create(context.Background(), k)
 
@@ -799,7 +720,7 @@ func (h *Handler) deleteNode(w http.ResponseWriter, r *http.Request) {
 			logrus.Errorf("update cluster %s caused %v", kubeID, err)
 		}
 
-		err = <-errChan
+		err = <-t.Run(context.Background(), *config, writer)
 
 		if err != nil {
 			logrus.Errorf("delete node %s from cluster %s caused %v", nodeName, kubeID, err)
@@ -827,25 +748,28 @@ func (h *Handler) getKubeTasks(ctx context.Context, kubeID string) ([]*workflows
 	}
 
 	tasks := make([]*workflows.Task, 0, len(k.Tasks))
-	for _, taskID := range k.Tasks {
-		t, err := h.repo.Get(ctx, workflows.Prefix, taskID)
 
-		// If one of tasks not found we dont care, because
-		// they may npt be created yet
-		if err != nil {
-			logrus.Debugf("task %s not found", taskID)
-			continue
+	for _, taskSet := range k.Tasks {
+		for _, taskID := range taskSet {
+			t, err := h.repo.Get(ctx, workflows.Prefix, taskID)
+
+			// If one of tasks not found we dont care, because
+			// they may npt be created yet
+			if err != nil {
+				logrus.Debugf("task %s not found", taskID)
+				continue
+			}
+
+			task := &workflows.Task{}
+			err = json.Unmarshal(t, task)
+
+			if err != nil {
+				return nil, errors.Wrapf(err,
+					"get task %s", taskID)
+			}
+
+			tasks = append(tasks, task)
 		}
-
-		task := &workflows.Task{}
-		err = json.Unmarshal(t, task)
-
-		if err != nil {
-			return nil, errors.Wrapf(err,
-				"get task %s", taskID)
-		}
-
-		tasks = append(tasks, task)
 	}
 
 	return tasks, nil
@@ -963,7 +887,7 @@ func (h *Handler) getClusterMetrics(w http.ResponseWriter, r *http.Request) {
 			"cpu":    "api/v1/query?query=:node_cpu_utilisation:avg1m",
 			"memory": "api/v1/query?query=:node_memory_utilisation:",
 		}
-		masterNode *node.Node
+		masterNode *model.Machine
 		response   = map[string]interface{}{}
 		baseUrl    = "api/v1/namespaces/default/services/prometheus-operated:9090/proxy"
 	)
@@ -1015,7 +939,7 @@ func (h *Handler) getNodesMetrics(w http.ResponseWriter, r *http.Request) {
 			"cpu":    "api/v1/query?query=node:node_cpu_utilisation:avg1m",
 			"memory": "api/v1/query?query=node:node_memory_utilisation:",
 		}
-		masterNode *node.Node
+		masterNode *model.Machine
 		response   = map[string]map[string]interface{}{}
 		baseUrl    = "api/v1/namespaces/default/services/prometheus-operated:9090/proxy"
 	)
@@ -1077,14 +1001,8 @@ func (h *Handler) getNodesMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) getServices(w http.ResponseWriter, r *http.Request) {
-	var (
-		servicesUrl = "api/v1/services"
-		kubeID      string
-		masterNode  *node.Node
-		k8sServices = &k8SServices{}
-	)
 	vars := mux.Vars(r)
-	kubeID = vars["kubeID"]
+	kubeID := vars["kubeID"]
 
 	k, err := h.svc.Get(r.Context(), kubeID)
 	if err != nil {
@@ -1096,38 +1014,15 @@ func (h *Handler) getServices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for key := range k.Masters {
-		if k.Masters[key] != nil {
-			masterNode = k.Masters[key]
-		}
-	}
-
-	serviceURL := fmt.Sprintf("https://%s/%s", masterNode.PublicIp, servicesUrl)
-	req, err := http.NewRequest(http.MethodGet, serviceURL, nil)
-	req.SetBasicAuth(k.User, k.Password)
-
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	client := &http.Client{
-		Transport: tr,
-	}
-	resp, err := client.Do(req)
-
+	// TODO: use sg specific label
+	selector := fmt.Sprintf("%s=%s", clusterService, "true")
+	svcList, err := h.listK8sServices(k, selector)
 	if err != nil {
 		message.SendUnknownError(w, err)
 		return
 	}
 
-	err = json.NewDecoder(resp.Body).Decode(k8sServices)
-
-	if err != nil {
-		logrus.Error(err)
-		message.SendInvalidJSON(w, err)
-		return
-	}
-
-	// TODO(stgleb): Figure out which ports are worth to be proxy
+	// TODO(stgleb): Figure out which ports are worth to be proxy. These are name aliases for ports!
 	webPorts := map[string]struct{}{
 		"web":     {},
 		"http":    {},
@@ -1136,54 +1031,33 @@ func (h *Handler) getServices(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var serviceInfos = make([]*ServiceInfo, 0)
-	var targetServices = make([]*proxy.Target, 0)
+	var targetServices = make([]proxy.Target, 0)
 
-	for _, service := range k8sServices.Items {
-		if !contains("kubernetes.io/cluster-service", "true", service.Metadata.Labels) {
-			continue
-		}
+	cfg, err := NewConfigFor(k)
+	if err != nil {
+		message.SendUnknownError(w, err)
+		return
+	}
+	for _, service := range svcList.Items {
+		for _, port := range service.Spec.Ports {
+			if _, ok := webPorts[port.Name]; !ok && port.Protocol != "TCP" {
+				continue
+			}
 
-		if len(service.Spec.Ports) == 1 && service.Spec.Ports[0].Protocol == "TCP" {
 			var serviceInfo = &ServiceInfo{
-				ID:        service.Metadata.UID,
-				Name:      service.Metadata.Name,
-				Type:      service.Spec.Type,
-				Namespace: service.Metadata.Namespace,
+				ID:        string(service.UID),
+				Name:      service.Name,
+				Namespace: service.Namespace,
+				Type:      string(service.Spec.Type),
 			}
 			serviceInfos = append(serviceInfos, serviceInfo)
 
-			targetServices = append(targetServices, &proxy.Target{
-				ProxyID: kubeID + service.Metadata.UID,
-				TargetURL: fmt.Sprintf("https://%s%s:%d/proxy",
-					masterNode.PublicIp, service.Metadata.SelfLink, service.Spec.Ports[0].Port),
-				SelfLink: service.Metadata.SelfLink,
-				User:     k.User,
-				Password: k.Password,
+			targetServices = append(targetServices, proxy.Target{
+				ProxyID: kubeID + string(service.ObjectMeta.UID),
+				// TargetPort is ignored here
+				TargetURL:  fmt.Sprintf("%s%s:%d/proxy", cfg.Host, service.ObjectMeta.SelfLink, port.Port),
+				KubeConfig: cfg,
 			})
-			continue
-		}
-
-		for _, port := range service.Spec.Ports {
-			if port.Protocol == "TCP" {
-				if _, ok := webPorts[port.Name]; ok {
-					var serviceInfo = &ServiceInfo{
-						ID:        service.Metadata.UID,
-						Name:      service.Metadata.Name,
-						Type:      service.Spec.Type,
-						Namespace: service.Metadata.Namespace,
-					}
-					serviceInfos = append(serviceInfos, serviceInfo)
-
-					targetServices = append(targetServices, &proxy.Target{
-						ProxyID: kubeID + service.Metadata.UID,
-						TargetURL: fmt.Sprintf("https://%s%s:%d/proxy",
-							masterNode.PublicIp, service.Metadata.SelfLink, port.Port),
-						SelfLink: service.Metadata.SelfLink,
-						User:     k.User,
-						Password: k.Password,
-					})
-				}
-			}
 		}
 	}
 
@@ -1195,9 +1069,11 @@ func (h *Handler) getServices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var proxies = h.proxies.GetProxies(kubeID)
-
+	proxies := h.proxies.GetProxies(kubeID)
 	for _, service := range serviceInfos {
+		if proxies[kubeID+service.ID] == nil {
+			continue
+		}
 		service.ProxyPort = proxies[kubeID+service.ID].Port()
 	}
 
@@ -1214,4 +1090,80 @@ func contains(name, value string, labels map[string]string) bool {
 	}
 
 	return false
+}
+
+func (h *Handler) restartKubeProvisioning(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	kubeID := vars["kubeID"]
+
+	logrus.Debugf("Get kube %s", kubeID)
+	k, err := h.svc.Get(r.Context(), kubeID)
+	if err != nil {
+		if sgerrors.IsNotFound(err) {
+			message.SendNotFound(w, kubeID, err)
+			return
+		}
+		message.SendUnknownError(w, err)
+		return
+	}
+
+	logrus.Debugf("Get cloud profile %s", k.ProfileID)
+	kubeProfile, err := h.profileSvc.Get(r.Context(), k.ProfileID)
+
+	if err != nil {
+		if sgerrors.IsNotFound(err) {
+			message.SendNotFound(w, k.ProfileID, err)
+			return
+		}
+
+		message.SendUnknownError(w, err)
+		return
+	}
+
+	config := steps.NewConfigFromKube(kubeProfile, k)
+
+	logrus.Debugf("load clout specific data from kube %s", k.ID)
+	// Load things specific to cloud provider
+	err = util.LoadCloudSpecificDataFromKube(k, config)
+
+	if err != nil {
+		message.SendUnknownError(w, err)
+		return
+	}
+
+	logrus.Debugf("Get cloud account %s", k.AccountName)
+	acc, err := h.accountService.Get(r.Context(), k.AccountName)
+
+	if err != nil {
+		if sgerrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return
+		}
+
+		message.SendUnknownError(w, err)
+		return
+	}
+
+	logrus.Debug("Fill config with cloud account credentials")
+	err = util.FillCloudAccountCredentials(r.Context(), acc, config)
+
+	if err != nil {
+		if sgerrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return
+		}
+		message.SendUnknownError(w, err)
+		return
+	}
+
+	logrus.Debugf("Restart cluster %s provisioning", k.ID)
+	err = h.kubeProvisioner.RestartClusterProvisioning(r.Context(),
+		kubeProfile, config, k.Tasks)
+
+	if err != nil {
+		message.SendUnknownError(w, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
 }

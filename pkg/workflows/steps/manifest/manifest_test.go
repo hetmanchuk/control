@@ -11,7 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/supergiant/control/pkg/node"
+	"github.com/supergiant/control/pkg/model"
 	"github.com/supergiant/control/pkg/profile"
 	"github.com/supergiant/control/pkg/runner"
 	"github.com/supergiant/control/pkg/templatemanager"
@@ -56,11 +56,12 @@ func TestWriteManifestMaster(t *testing.T) {
 
 	output := new(bytes.Buffer)
 	p := profile.Profile{
-		K8SVersion:  kubernetesVersion,
-		RBACEnabled: true,
+		K8SVersion:      kubernetesVersion,
+		RBACEnabled:     true,
+		K8SServicesCIDR: "10.3.0.0/16",
 	}
 	cfg := steps.NewConfig("", "", "", p)
-	cfg.Node = node.Node{
+	cfg.Node = model.Machine{
 		PrivateIp: masterHost,
 	}
 
@@ -133,12 +134,13 @@ func TestWriteManifestNode(t *testing.T) {
 
 	output := new(bytes.Buffer)
 	p := profile.Profile{
-		K8SVersion:  kubernetesVersion,
-		RBACEnabled: false,
+		K8SVersion:      kubernetesVersion,
+		RBACEnabled:     false,
+		K8SServicesCIDR: "10.3.0.0/16",
 	}
 	cfg := steps.NewConfig("", "", "", p)
-	cfg.AddMaster(&node.Node{
-		State:     node.StateActive,
+	cfg.AddMaster(&model.Machine{
+		State:     model.MachineStateActive,
 		PrivateIp: masterHost,
 	})
 	cfg.Runner = r
@@ -182,9 +184,11 @@ func TestWriteManifestError(t *testing.T) {
 
 	proxyTemplate, err := template.New(StepName).Parse("")
 	output := new(bytes.Buffer)
-	cfg := steps.NewConfig("", "", "", profile.Profile{})
-	cfg.AddMaster(&node.Node{
-		State:     node.StateActive,
+	cfg := steps.NewConfig("", "", "", profile.Profile{
+		K8SServicesCIDR: "10.3.0.0/16",
+	})
+	cfg.AddMaster(&model.Machine{
+		State:     model.MachineStateActive,
 		PrivateIp: "127.0.0.1",
 	})
 	cfg.Runner = r
@@ -264,5 +268,14 @@ func TestInitPanic(t *testing.T) {
 
 	if s == nil {
 		t.Error("Step not found")
+	}
+}
+
+func TestStep_Description(t *testing.T) {
+	s := &Step{}
+
+	if desc := s.Description(); desc != "Write manifes to /etc/kubernetes" {
+		t.Errorf("Wrong desription expected %s actual %s",
+			"Write manifes to /etc/kubernetes", desc)
 	}
 }

@@ -9,7 +9,6 @@ import (
 
 	"github.com/supergiant/control/pkg/clouds"
 	"github.com/supergiant/control/pkg/model"
-	"github.com/supergiant/control/pkg/node"
 	"github.com/supergiant/control/pkg/sgerrors"
 	"github.com/supergiant/control/pkg/workflows/steps"
 )
@@ -106,6 +105,21 @@ func TestFillCloudAccountCredentials(t *testing.T) {
 			err: nil,
 		},
 		{
+			testName: "aws",
+			cloudAccount: &model.CloudAccount{
+				Name:     "testName",
+				Provider: clouds.GCE,
+				Credentials: map[string]string{
+					"projectId":   "ordinal-case-222023",
+					"privateKey":  "-----BEGIN PRIVATE KEY-----\n\n-----END PRIVATE KEY-----\n",
+					"clientEmail": "myemail@gmail.comn",
+					"tokenURI":    "https://oauth2.googleapis.com/token",
+					"publicKey":   "ssh-rsa  myemail@gmail.com",
+				},
+			},
+			err: nil,
+		},
+		{
 			testName: "unknown provider",
 			cloudAccount: &model.CloudAccount{
 				Name:     "testName",
@@ -147,9 +161,9 @@ func TestFillCloudAccountCredentials(t *testing.T) {
 			}
 		}
 
-		if config.SshConfig.PublicKey != testCase.cloudAccount.Credentials["publicKey"] {
+		if config.Kube.SSHConfig.PublicKey != testCase.cloudAccount.Credentials["publicKey"] {
 			t.Errorf("PublicKey %s not found in credentials %v",
-				testCase.cloudAccount.Credentials["publicKey"], config.SshConfig.PublicKey)
+				testCase.cloudAccount.Credentials["publicKey"], config.Kube.SSHConfig.PublicKey)
 		}
 
 		if err != testCase.err {
@@ -189,6 +203,11 @@ func TestMakeKeyName(t *testing.T) {
 			expectedResult: fmt.Sprintf("%s-user", "test"),
 		},
 		{
+			keyName:        "",
+			isUser:         false,
+			expectedResult: "-provision",
+		},
+		{
 			keyName:        "test",
 			isUser:         false,
 			expectedResult: fmt.Sprintf("%s-provision", "test"),
@@ -198,7 +217,7 @@ func TestMakeKeyName(t *testing.T) {
 	for _, testCase := range testCases {
 		actual := MakeKeyName(testCase.keyName, testCase.isUser)
 
-		if !strings.EqualFold(actual, testCase.expectedResult) {
+		if !strings.Contains(actual, testCase.expectedResult) {
 			t.Errorf("Wrong key name expected %s actual %s",
 				testCase.expectedResult, actual)
 		}
@@ -211,12 +230,12 @@ func TestMakeRole(t *testing.T) {
 	for _, testCase := range testCases {
 		role := MakeRole(testCase)
 
-		if testCase && !strings.EqualFold(role, string(node.RoleMaster)) {
-			t.Errorf("Wrong role expected %s actual %s", node.RoleMaster, role)
+		if testCase && !strings.EqualFold(role, string(model.RoleMaster)) {
+			t.Errorf("Wrong role expected %s actual %s", model.RoleMaster, role)
 		}
 
-		if !testCase && !strings.EqualFold(role, string(node.RoleNode)) {
-			t.Errorf("Wrong role expected %s actual %s", node.RoleNode, role)
+		if !testCase && !strings.EqualFold(role, string(model.RoleNode)) {
+			t.Errorf("Wrong role expected %s actual %s", model.RoleNode, role)
 		}
 	}
 }
@@ -271,20 +290,20 @@ func TestBindParams(t *testing.T) {
 }
 
 func TestGetRandomNode(t *testing.T) {
-	n := &node.Node{}
+	n := &model.Machine{}
 
 	testCases := []struct {
-		nodeMap      map[string]*node.Node
-		expectedNode *node.Node
+		nodeMap      map[string]*model.Machine
+		expectedNode *model.Machine
 	}{
 		{
-			nodeMap: map[string]*node.Node{
+			nodeMap: map[string]*model.Machine{
 				"node-1": n,
 			},
 			expectedNode: n,
 		},
 		{
-			nodeMap:      map[string]*node.Node{},
+			nodeMap:      map[string]*model.Machine{},
 			expectedNode: nil,
 		},
 	}
@@ -295,6 +314,110 @@ func TestGetRandomNode(t *testing.T) {
 		if actual != testCase.expectedNode {
 			t.Errorf("expected node %v actual %v",
 				testCase.expectedNode, actual)
+		}
+	}
+}
+
+func TestGetWriter(t *testing.T) {
+	testCases := []struct {
+		name   string
+		hasErr bool
+	}{
+		{
+			name:   "test.txt",
+			hasErr: false,
+		},
+		{
+			name:   "",
+			hasErr: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		writer, err := GetWriter(testCase.name)
+
+		if err == nil && testCase.hasErr {
+			t.Errorf("error must not be nil")
+		}
+
+		if testCase.hasErr && writer == nil {
+			t.Errorf("Writer must not be nil")
+		}
+	}
+}
+
+func TestLoadCloudSpecificDataFromKube(t *testing.T) {
+	testCases := []struct {
+		description string
+		kube        *model.Kube
+		provider    clouds.Name
+		hasErr      bool
+	}{
+		{
+			description: "digitalocean",
+			kube: &model.Kube{
+				Region: "fra-1",
+			},
+			provider: clouds.DigitalOcean,
+		},
+		{
+			description: "gce",
+			kube:        &model.Kube{},
+			provider:    clouds.GCE,
+		},
+		{
+			description: "aws",
+			kube: &model.Kube{
+				CloudSpec: map[string]string{
+					clouds.AwsImageID:               "imageId",
+					clouds.AwsVpcID:                 "vpcId",
+					clouds.AwsNodeInstanceProfile:   "nodeProfile",
+					clouds.AwsMasterInstanceProfile: "masterProfile",
+					clouds.AwsInternetGateWayID:     "internetGWId",
+					clouds.AwsNodesSecgroupID:       "nodesSecurityId",
+					clouds.AwsMastersSecGroupID:     "masterSecGroup",
+					clouds.AwsAZ:                    "az",
+					clouds.AwsRouteTableID:          "routetableid",
+					clouds.AWSAccessKeyID:           "accessKey",
+					clouds.AWSSecretKey:             "secretKey",
+					clouds.AwsKeyPairName:           "keyPairName",
+				},
+			},
+			provider: clouds.AWS,
+		},
+		{
+			description: "unsupported",
+			kube: &model.Kube{
+				CloudSpec: map[string]string{},
+			},
+			provider: clouds.Name("unsupported"),
+			hasErr:   true,
+		},
+		{
+			description: "nil value",
+			hasErr:      true,
+		},
+		{
+			description: "cloud spec is nil",
+			hasErr:      false,
+			kube: &model.Kube{
+				Provider: clouds.AWS,
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		config := &steps.Config{
+			Provider: testCase.provider,
+		}
+		err := LoadCloudSpecificDataFromKube(testCase.kube, config)
+
+		if testCase.hasErr && err == nil {
+			t.Errorf("TC: %s: error should not be nil", testCase.description)
+		}
+
+		if !testCase.hasErr && err != nil {
+			t.Errorf("TC: %s: unexpected error %v", testCase.description, err)
 		}
 	}
 }

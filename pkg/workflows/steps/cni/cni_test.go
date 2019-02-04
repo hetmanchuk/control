@@ -11,7 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"github.com/supergiant/control/pkg/node"
+	"github.com/supergiant/control/pkg/model"
 	"github.com/supergiant/control/pkg/profile"
 	"github.com/supergiant/control/pkg/runner"
 	"github.com/supergiant/control/pkg/templatemanager"
@@ -84,8 +84,8 @@ func TestCNIErrors(t *testing.T) {
 
 	cfg := steps.NewConfig("", "", "", profile.Profile{})
 	cfg.Runner = r
-	cfg.AddMaster(&node.Node{
-		State:     node.StateActive,
+	cfg.AddMaster(&model.Machine{
+		State:     model.MachineStateActive,
 		PrivateIp: "10.20.30.40",
 	})
 	err = task.Run(context.Background(), output, cfg)
@@ -135,11 +135,39 @@ func TestNew(t *testing.T) {
 }
 
 func TestInit(t *testing.T) {
+	templatemanager.SetTemplate(StepName, &template.Template{})
 	Init()
 
 	s := steps.GetStep(StepName)
 
 	if s == nil {
 		t.Error("Step not found")
+	}
+
+	templatemanager.DeleteTemplate(StepName)
+}
+
+func TestInitPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("recover output must not be nil")
+		}
+	}()
+
+	Init()
+
+	s := steps.GetStep("not_found.sh.tpl")
+
+	if s == nil {
+		t.Error("Step not found")
+	}
+}
+
+func TestStep_Description(t *testing.T) {
+	s := &Step{}
+
+	if desc := s.Description(); desc != "install CNI plugin" {
+		t.Errorf("Wrong desription expected %s actual %s",
+			"install CNI plugin", desc)
 	}
 }

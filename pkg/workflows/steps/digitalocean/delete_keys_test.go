@@ -8,6 +8,7 @@ import (
 
 	"github.com/digitalocean/godo"
 
+	"github.com/supergiant/control/pkg/model"
 	"github.com/supergiant/control/pkg/sgerrors"
 	"github.com/supergiant/control/pkg/workflows/steps"
 )
@@ -102,9 +103,11 @@ func TestDeleteKeysStep_Run(t *testing.T) {
 		}
 
 		config := &steps.Config{
-			SshConfig: steps.SshConfig{
-				PublicKey:          testKey,
-				BootstrapPublicKey: testKey,
+			Kube: model.Kube{
+				SSHConfig: model.SSHConfig{
+					PublicKey:          testKey,
+					BootstrapPublicKey: testKey,
+				},
 			},
 		}
 		step.Run(context.Background(), ioutil.Discard, config)
@@ -126,6 +129,10 @@ func TestNewDeleteKeysStep(t *testing.T) {
 
 	if step.getKeyService == nil {
 		t.Errorf("Step value must not be nil")
+	}
+
+	if svc := step.getKeyService("token"); svc == nil {
+		t.Errorf("key service must be nil")
 	}
 }
 

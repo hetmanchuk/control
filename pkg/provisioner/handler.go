@@ -3,6 +3,7 @@ package provisioner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -22,6 +23,10 @@ import (
 	"github.com/supergiant/control/pkg/workflows/steps"
 )
 
+const (
+	DefaultK8SServicesCIDR = "10.3.0.0/16"
+)
+
 type AccountGetter interface {
 	Get(context.Context, string) (*model.CloudAccount, error)
 }
@@ -30,10 +35,15 @@ type KubeGetter interface {
 	Get(ctx context.Context, name string) (*model.Kube, error)
 }
 
+type ProfileCreater interface {
+	Create(context.Context, *profile.Profile) error
+}
+
 type Handler struct {
-	accountGetter AccountGetter
-	kubeGetter    KubeGetter
-	provisioner   ClusterProvisioner
+	accountGetter  AccountGetter
+	profileService ProfileCreater
+	kubeGetter     KubeGetter
+	provisioner    ClusterProvisioner
 }
 
 type ProvisionRequest struct {
@@ -51,11 +61,15 @@ type ClusterProvisioner interface {
 	ProvisionCluster(context.Context, *profile.Profile, *steps.Config) (map[string][]*workflows.Task, error)
 }
 
-func NewHandler(kubeService KubeGetter, cloudAccountService *account.Service, provisioner ClusterProvisioner) *Handler {
+func NewHandler(kubeService KubeGetter,
+	cloudAccountService *account.Service,
+	profileSvc ProfileCreater,
+	provisioner ClusterProvisioner) *Handler {
 	return &Handler{
-		kubeGetter:    kubeService,
-		accountGetter: cloudAccountService,
-		provisioner:   provisioner,
+		kubeGetter:     kubeService,
+		profileService: profileSvc,
+		accountGetter:  cloudAccountService,
+		provisioner:    provisioner,
 	}
 }
 
@@ -85,20 +99,24 @@ func (h *Handler) Provision(w http.ResponseWriter, r *http.Request) {
 	logrus.Infof("cluster token for ETCD %s", clusterToken)
 
 	// TODO: use staticAuth instead of user/password
+	// TODO: replace usage of user/password with TLS certificates
 	if req.Profile.User == "" || req.Profile.Password == "" {
-		req.Profile.User = "root"
-		req.Profile.Password = "1234"
+		req.Profile.User = util.RandomString(8)
+		req.Profile.Password = util.RandomString(16)
 
 		req.Profile.StaticAuth.BasicAuth = append(req.Profile.StaticAuth.BasicAuth, profile.BasicAuthUser{
-			Password: "1234",
-			Name:     "root",
-			ID:       "1234",
+			Password: req.Profile.Password,
+			Name:     req.Profile.User,
+			ID:       req.Profile.User,
 			Groups:   []string{pki.MastersGroup},
 		})
 	}
 
-	config := steps.NewConfig(req.ClusterName, clusterToken,
-		req.CloudAccountName, req.Profile)
+	if req.Profile.K8SServicesCIDR == "" {
+		req.Profile.K8SServicesCIDR = DefaultK8SServicesCIDR
+	}
+
+	config := steps.NewConfig(req.ClusterName, clusterToken, req.CloudAccountName, req.Profile)
 
 	acc, err := h.accountGetter.Get(r.Context(), req.CloudAccountName)
 
@@ -121,6 +139,17 @@ func (h *Handler) Provision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Assign ID to profile
+	id := uuid.New()
+
+	if len(id) > 0 {
+		req.Profile.ID = uuid.New()[:8]
+	} else {
+		http.Error(w, fmt.Sprintf("generated id is too short %s", id), http.StatusInternalServerError)
+		logrus.Error(errors.New(fmt.Sprintf("generated id %s is too short", id)))
+		return
+	}
+
 	ctx, _ := context.WithTimeout(context.Background(), config.Timeout)
 	taskMap, err := h.provisioner.ProvisionCluster(ctx, &req.Profile, config)
 
@@ -128,6 +157,10 @@ func (h *Handler) Provision(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		logrus.Error(errors.Wrap(err, "provisionCluster"))
 		return
+	}
+
+	if err := h.profileService.Create(r.Context(), &req.Profile); err != nil {
+		logrus.Debugf("Error creating profile %s", req.Profile.ID)
 	}
 
 	roleTaskIdMap := make(map[string][]string, len(taskMap))

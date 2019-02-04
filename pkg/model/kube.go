@@ -2,13 +2,13 @@ package model
 
 import (
 	"github.com/supergiant/control/pkg/clouds"
-	"github.com/supergiant/control/pkg/node"
 	"github.com/supergiant/control/pkg/profile"
 )
 
 type KubeState string
 
 const (
+	StatePrepare      KubeState = "prepare"
 	StateProvisioning KubeState = "provisioning"
 	StateFailed       KubeState = "failed"
 	StateOperational  KubeState = "operational"
@@ -17,21 +17,17 @@ const (
 
 // Kube represents a kubernetes cluster.
 type Kube struct {
-	ID          string      `json:"id" valid:"-"`
-	State       KubeState   `json:"state"`
-	Name        string      `json:"name" valid:"required"`
-	Provider    clouds.Name `json:"provider" valid:"in(aws|digitalocean|packet|gce|openstack)"`
-	RBACEnabled bool        `json:"rbacEnabled"`
-	AccountName string      `json:"accountName"`
-	Region      string      `json:"region"`
-	Zone        string      `json:"zone" valid:"-"`
-	APIPort     string      `json:"apiPort"`
-	Auth        Auth        `json:"auth"`
-	SshUser     string      `json:"sshUser"`
-
-	SshPublicKey        []byte `json:"sshKey"`
-	BootstrapPublicKey  []byte `json:"bootstrapPublicKey"`
-	BootstrapPrivateKey []byte `json:"bootstrapPrivateKey"`
+	ID           string      `json:"id" valid:"-"`
+	State        KubeState   `json:"state"`
+	Name         string      `json:"name" valid:"required"`
+	Provider     clouds.Name `json:"provider" valid:"in(aws|digitalocean|packet|gce|openstack)"`
+	RBACEnabled  bool        `json:"rbacEnabled"`
+	AccountName  string      `json:"accountName"`
+	Region       string      `json:"region"`
+	Zone         string      `json:"zone" valid:"-"`
+	ServicesCIDR string      `json:"servicesCIDR"`
+	APIPort      string      `json:"apiPort"`
+	Auth         Auth        `json:"auth"`
 
 	User     string `json:"user" valid:"-"`
 	Password string `json:"password" valid:"-"`
@@ -47,10 +43,31 @@ type Kube struct {
 
 	CloudSpec profile.CloudSpecificSettings `json:"cloudSpec" valid:"-"`
 
-	Masters map[string]*node.Node `json:"masters"`
-	Nodes   map[string]*node.Node `json:"nodes"`
+	ProfileID string `json:"profileId"`
+
+	Masters map[string]*Machine `json:"masters"`
+	Nodes   map[string]*Machine `json:"nodes"`
 	// Store taskIds of tasks that are made to provision this kube
-	Tasks []string `json:"tasks"`
+	Tasks map[string][]string `json:"tasks"`
+
+	SSHConfig SSHConfig `json:"sshConfig"`
+	// DEPRECATED
+	SshUser string `json:"sshUser"`
+	// DEPRECATED
+	SshPublicKey []byte `json:"sshKey"`
+	// DEPRECATED
+	BootstrapPublicKey []byte `json:"bootstrapPublicKey"`
+	// DEPRECATED
+	BootstrapPrivateKey []byte `json:"bootstrapPrivateKey"`
+}
+
+type SSHConfig struct {
+	User                string `json:"user"`
+	Port                string `json:"port"`
+	BootstrapPrivateKey string `json:"bootstrapPrivateKey"`
+	BootstrapPublicKey  string `json:"bootstrapPublicKey"`
+	PublicKey           string `json:"publicKey"`
+	Timeout             int    `json:"timeout"`
 }
 
 // Auth holds all possible auth parameters.
